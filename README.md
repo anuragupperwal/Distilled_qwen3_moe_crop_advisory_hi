@@ -1,7 +1,3 @@
-This README is designed to bridge the gap between high-level agricultural application and the deep-learning "weight surgery" involved in the model’s creation.
-
----
-
 # Distilled-Qwen3-MoE: Upcycled Sparse Mixture-of-Experts for Hindi Crop Advisory
 
 This project focuses on the development of a high-efficiency, reasoning-capable Language Model specifically optimized for the Indian agricultural sector. By "upcycling" the **Qwen3-0.6B** dense model into a **Sparse Mixture-of-Experts (MoE)** architecture, we achieve a model that maintains a small deployment footprint while significantly increasing its specialized capacity for Hindi-language crop diagnostics and advisory.
