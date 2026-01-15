@@ -94,7 +94,7 @@ This is the most critical part for your specific project.
 
 This is your entry point for training. It should:
 
-1. Load the Teacher (Qwen3-0.6B).
+1. Load the Teacher (Qwen3-14B).
 2. Load the Student (Your Upcycled MoE).
 3. Load the data.
 4. Run the forward passes and calculate `Loss = Alpha * Task_Loss + Beta * CKA_Loss`.
