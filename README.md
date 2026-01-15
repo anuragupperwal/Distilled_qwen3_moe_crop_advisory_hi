@@ -44,32 +44,31 @@ While the architecture is cutting-edge, the objective is practical: providing re
 
 ```text
 qwen3-moe-project/
-├── src/
-│   ├── modeling/
-│   │   ├── __init__.py
-│   │   ├── configuration_qwen3_moe.py   # Hyperparams (num_experts, etc.)
-│   │   ├── modular_qwen3_moe.py         # THE SOURCE: Your custom logic
-│   │   └── modeling_qwen3_moe.py        # GENERATED: Standalone for production
-│   ├── surgery/
-│   │   ├── __init__.py
-│   │   ├── upcycle.py                   # Script to convert 0.6B Dense -> MoE
-│   │   └── vocab_extender.py            # Logic for adding <thought> tokens
-│   └── utils/
-│       ├── __init__.py
-│       ├── cka_loss.py                  # Centered Kernel Alignment implementation
-│       └── distil_utils.py              # Custom loss functions for distillation
-├── scripts/
-│   ├── run_upcycle.sh                   # Bash script to trigger weight surgery
-│   ├── train_distill.py                 # Main training/distillation loop
-│   └── eval_cka.py                      # Validation script for structural parity
-├── configs/
-│   ├── base_upsample.yaml               # Training params for CKA phase
-│   └── thought_distill.yaml             # Training params for Thinking phase
-├── data/                                # Local samples for initial testing
-├── tests/                               # Unit tests for router logic
-└── requirements.txt
+├── litgpt/                 <-- The Core (Keep these)
+│   ├── model.py            # MODIFIED: Add LLaMAMoE class here
+│   ├── config.py           # MODIFIED: Add Qwen-MoE hyperparams here
+│   ├── tokenizer.py        # Keep (Standard)
+│   └── utils.py            # ADD: CKA calculation function
+├── scripts/                <-- Tools & Surgery
+│   ├── download.py         # Keep (To get 0.6B weights)
+│   ├── upcycle_moe.py      # YOUR SCRIPT: Dense -> MoE conversion
+│   └── convert_hf.py       # Keep (To convert HuggingFace weights)
+├── configs/                <-- Configuration Hub
+│   ├── upsample.yaml       # Hyperparams for the MoE shift
+│   └── distill.yaml        # Distillation settings
+├── train_distill.py        # YOUR MAIN WORK: The training loop
+├── eval_cka.py             # YOUR ANALYSIS: Run this to get similarity scores
+├── requirements.txt        # Add 'torch-cka' if using the library
+└── data/                   # Dataset for distillation
 ```
 
+scripts/upcycle_moe.py
+scripts/convert_hf_checkpoint.py
+scripts/download.py
+litgpt/utils.py
+litgpt/tokenizer.py
+litgpt/model.py
+litgpt/config.py
 
 
 #### 1. `src/modeling/` (The Architecture)
@@ -106,3 +105,11 @@ This is your entry point for training. It should:
 ### Contact & Contribution
 
 This project is currently in the **Architecture Validation** phase. If you are interested in the intersection of MoE upcycling and Indic-language LLMs for social good, please reach out.
+
+
+
+
+Commands:
+
+* to run as package:
+pip install -e .
