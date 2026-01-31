@@ -108,8 +108,9 @@ This project is currently in the **Architecture Validation** phase. If you are i
 
 
 
+---
 
-Commands:
+### Commands:
 
 * to run as package:
 pip install -e .
