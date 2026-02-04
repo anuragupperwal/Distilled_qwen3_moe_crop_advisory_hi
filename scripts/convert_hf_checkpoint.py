@@ -680,7 +680,7 @@ def copy_weights_qwen_3(
         )
     else:
         raise NotImplementedError
-
+    
     if progress_per_file is not None:
         progress_per_file = progress_per_file / max(1, len(hf_weights) + len(qkv_weights))
 
@@ -893,3 +893,18 @@ def convert_hf_checkpoint(
                 copy_fn(sd, hf_weights, saver=saver, dtype=dtype, debug_mode=debug_mode)
         print(f"Saving converted checkpoint to {checkpoint_dir}")
         saver.save(sd)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

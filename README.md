@@ -37,7 +37,37 @@ While the architecture is cutting-edge, the objective is practical: providing re
 * **Dynamic Advisory:** Unlike static lookup tables, the model synthesizes advice based on variables like soil health, crop age, and current weather conditions.
 * **Bilingual Reasoning:** While the input and output are in Hindi, the model leverages its English pre-training for technical botanical knowledge, translating complex agricultural science into actionable Hindi instructions.
 
+
 ---
+
+## 🚀 Research Overview: CKA-Guided MoE Distillation
+
+This project implements a "Thesis-Grade" knowledge distillation pipeline to compress a **Qwen3-14B (Teacher)** into an upcycled **Qwen3-0.6B-MoE (Student)** using a specialized Hindi Agricultural dataset.
+
+### 🧪 Key Technical Innovations
+
+* **Linear CKA Distillation:** Replaces rigid MSE loss with Centered Kernel Alignment (CKA) for feature mapping. This allows the Student () to align its internal manifolds with the Teacher () without requiring noisy projection layers.
+* **Expert Diversity via CKA:** Utilizes an internal diversity penalty (minimizing CKA similarity between MoE experts) to mitigate "Expert Collapse" and force specialization across different agricultural domains.
+* **On-the-Fly Simultaneous Distillation:** Implements real-time feature extraction from both models during the training loop, eliminating the need for massive disk I/O and intermediate storage of teacher features.
+
+### 🛠️ Architectural Enhancements (`model.py`)
+
+To support this pipeline, the core architecture has been modified to:
+
+1. **Expose Hidden States:** The `forward` pass now optionally returns a list of intermediate hidden states from all transformer blocks for layer-wise CKA alignment.
+2. **Expert Contribution Hooks:** The `LLaMAMoE` class now captures and stores individual expert outputs during the forward pass to enable diversity loss calculations.
+3. **Dynamic Layer Mapping:** Implements a skip-based mapping strategy to align the Student's 28 layers with the Teacher's 40 layers effectively.
+
+### 📊 Distillation Strategy Summary
+
+| Loss Component | Objective | Metric |
+| --- | --- | --- |
+| **Logit Alignment** | Capture "Dark Knowledge" from final predictions. | KL-Divergence |
+| **Feature Alignment** | Align internal reasoning manifolds across architectures. | **Linear CKA** |
+| **Expert Diversity** | Prevent expert collapse and force specialization. | **1 - CKA** |
+
+---
+
 
 
 ## Project Structure
@@ -110,7 +140,195 @@ This project is currently in the **Architecture Validation** phase. If you are i
 
 ---
 
+### files:
+File,Brief Description,Key Role in Thesis
+train_distill.py
+Main execution engine for simultaneous distillation of Teacher (14B) and Student (0.6B)
+Orchestrates CKA manifold alignment and Expert Diversity loss.
+
+agri_data.py
+Custom Data Loader for Parquet files handling Scenario → Thinking → Advisory formatting.
+"Forces the model to learn reasoning by training on specific ""Thinking"" tokens."
+
+litgpt/model.py
+Modified LitGPT core with hooks for hidden states and MoE routing decisions.
+"Provides the structural ""hooks"" needed for CKA calculation and expert monitoring."
+
+litgpt/config.py
+Architectural registry for the upcycled 8-expert Qwen3-MoE configuration.
+Ensures model weights map correctly to the new sparse 0.6B-MoE structure.
+
+litgpt/tokenizer.py
+Tiktoken-based tokenization logic optimized for Qwen3 and Devanagari script.
+Correctly processes complex Hindi agricultural terminology.
+
+litgpt/utils.py
+Utility suite including chunked cross-entropy and parameter counting.
+Manages memory spikes on H100 and verifies model size metrics.
+
+scripts/upcycle_moe.py
+Weight surgery script mapping 1 dense MLP to 8 sparse experts with jitter.
+"Performs the initialization ""surgery"" for the sparse Student model."
+
+scripts/check_weights.py
+Audit utility for verifying layer shapes and router symmetry post-surgery.
+Confirms the Student model is structurally ready for distillation.
+
+scripts/convert_hf_checkpoint.py
+Bidirectional weight mapper for Hugging Face to LitGPT formats.
+Enables loading of pre-trained Qwen3 weights into the research engine.
+
+scripts/convert_lit_checkpoint.py
+Utility to convert distilled Student models back to Hugging Face format.
+Prepares the final model for standard NLP evaluation benchmarks.
+
+scripts/sanity_check_data.py
+Pre-flight script to decode and verify Hindi CoT data formatting.
+Ensures reasoning and advice boundaries are correctly tokenized.
+
+launch_train.sh
+H100 shell launcher setting PYTHONPATH and TensorFloat-32 optimizations.
+Ensures the server processes distillation at peak hardware efficiency.
+
+plot_specialization.py
+Visualization tool converting CKA matrices into heatmaps.
+Provides the visual proof of Expert Specialization for the thesis defense.
+
+
+---
+
 ### Commands:
 
 * to run as package:
 pip install -e .
+
+
+* Surgery: Run 
+    python -m scripts.upcycle_moe
+
+
+* Verification: Run 
+    python -m scripts.check_weights 
+    and 
+    python -m scripts.sanity_check_data
+
+* interactive GPU access
+srun --partition=debug --gres=gpu:1 --time=01:00:00 --pty bash
+
+* To check GPU load
+nvidia-smi
+* update VRAM info every 1s
+watch -n 1 nvidia-smi
+
+* Start Training: Run 
+    ./launch_train.sh 
+    within a tmux session 
+
+        Screen & Tmux: Why and How
+        When you run a long training job (like distillation) over SSH, if your internet flickers or your laptop goes to sleep, the SSH session dies—and so does your training.
+
+        Tmux (Terminal Multiplexer) creates a session on the server side. Even if you disconnect, the code keeps running.
+
+        How to use it:
+
+        The Workflow:
+        Start a new session: Type tmux and press Enter. You will see a green bar at the bottom of your terminal.
+        Run your code: Inside this session, 
+            run ./launch_train.sh.
+        Foolproof Way to Monitor : 
+            Press Ctrl + B, release, then press " (Double Quote key). This splits your screen horizontally.
+            watch -n 1 nvidia-smi
+        Detach (Leave it running): 
+            Press Ctrl + B, release both keys, and then press D. You can now safely close your terminal or laptop.
+        Re-attach (Check progress): 
+            When you log back in later, type tmux attach to return to your running session.
+
+* to submit slurm
+sbatch run_distill.slurm
+
+* to check progress
+squeue -u anurag
+
+* check last log
+cat logs/train_22408.err
+
+* Watch the Live Progress Bar To see the tqdm bar and loss values updating in real-time (just like in tmux), "tail" the output file:
+
+    Bash
+    # Replace 'train_22365.out' with your actual filename from the logs folder
+    tail -f logs/train_22365.out
+    You will see the training lines appearing as they happen.
+
+    Press Ctrl + C to stop watching (this does not stop the training; it just closes the view).
+
+
+* Resume if Time Runs Out
+    If the 4-hour limit hits and the job dies, you don't need to panic.
+
+    Check the logs: tail -n 20 logs/train_22365.out to see the last step saved.
+
+    Submit again: sbatch run_distill.slurm.
+
+    Automatic Resume: Because your train_distill.py loads the weights from student_path, ensure you update the student_path in your python script to point to the latest checkpoint (e.g., checkpoints/.../step-2000.pth) before submitting the new job.
+
+    Pro Tip: A smarter script would automatically look for the latest checkpoint, but manually updating the path takes 10 seconds.
+
+
+* 
+python test_inference.py
+
+* 
+python plot_results.py
+
+---
+
+
+### Chat format structure
+<|system|>
+{system_instruction}
+<|user|>
+स्थिति (Scenario):
+{Formatted Metadata from Prompt}
+<|thought|>
+{thoughts}
+<|assistant|>
+{advisory}
+<|endoftext|>
+
+---
+
+
+### Files:
+
+config.py - Defines the 40-layer Teacher and 28-layer MoE Student specs.
+model.py - The logic for Attention and MoE blocks; now modified to return hidden states and expert data.
+download.py - Downloads raw weights from Hugging Face.
+convert_hf.py - Converts Hugging Face naming conventions to your local litgpt format.
+upcycle_moe.py - Clones dense MLP weights into 8 (or 2) experts with symmetry-breaking jitter.
+tokenizer.py - Converts your Hindi/English agricultural text into numerical IDs.
+train_distill.py - The Main Command Center. Runs the White-Box distillation loop.
+
+
+
+---
+### Check file size
+
+* individually break down each file size
+du -sh *
+
+
+
+
+### References
+* your current $1e-5$ approach is the standard baseline used in the original Sparse Upcycling paper (Komatsuzaki et al.).
+
+
+### Tip for your Defense
+During your presentation, you can show a comparison of the Student's attention maps.
+
+Before Distillation: The attention is scattered.
+
+After CKA Distillation: The attention in the advisory section will show strong "activation peaks" back to the relevant parts of the thoughts section. This is visual proof that your model is actually "using" its internal thoughts.
+
+
+H100 Health: Keep a separate tmux pane open with watch -n 1 nvidia-smi. Ensure your VRAM usage is stable around 40-50GB.

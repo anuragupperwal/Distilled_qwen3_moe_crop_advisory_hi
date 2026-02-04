@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Union
+from sentencepiece import SentencePieceProcessor
+from tokenizers import Tokenizer as HFTokenizer
 
 import torch
 
@@ -20,46 +22,31 @@ class Tokenizer:
         self.bos_id = None
         self.eos_id = None
 
-        # some checkpoints have both files, `.json` takes precedence
-        if (vocabulary_path := checkpoint_dir / "tokenizer.json").is_file():
+        vocabulary_path_json = checkpoint_dir / "tokenizer.json"
+        vocabulary_path_model = checkpoint_dir / "tokenizer.model"
+
+        if vocabulary_path_json.is_file():
             from tokenizers import Tokenizer as HFTokenizer
-
-            self.processor = HFTokenizer.from_file(str(vocabulary_path))
+            self.processor = HFTokenizer.from_file(str(vocabulary_path_json))
             self.backend = "huggingface"
+            
+            # Load additional configs if they exist
+            self._load_special_token_ids(checkpoint_dir)
 
-            if (special_tokens_path := checkpoint_dir / "tokenizer_config.json").is_file():
-                with open(special_tokens_path, encoding="utf-8") as fp:
-                    config = json.load(fp)
-                bos_token = config.get("bos_token")
-                eos_token = config.get("eos_token")
-                if bos_token is not None and isinstance(bos_token, dict):
-                    bos_token = bos_token.get("content")
-                if eos_token is not None and isinstance(eos_token, dict):
-                    eos_token = eos_token.get("content")
-                self.bos_id = self.token_to_id(bos_token) if bos_token is not None else None
-                self.eos_id = self.token_to_id(eos_token) if eos_token is not None else None
-            if (special_tokens_path := checkpoint_dir / "generation_config.json").is_file():
-                try:
-                    with open(special_tokens_path, encoding="utf-8") as fp:
-                        config = json.load(fp)
-                except json.JSONDecodeError:  # Some files like the Llama 3.2 one have bugs
-                    with open(special_tokens_path, encoding="utf-8") as fp:
-                        json_string = fp.read()
-                        config = fix_and_load_json(json_string)
-                if self.bos_id is None:
-                    self.bos_id = config.get("bos_token_id")
-                if self.eos_id is None:
-                    self.eos_id = config.get("eos_token_id")
-
-        elif (vocabulary_path := checkpoint_dir / "tokenizer.model").is_file():
+        elif vocabulary_path_model.is_file():
             from sentencepiece import SentencePieceProcessor
-
-            self.processor = SentencePieceProcessor(model_file=str(vocabulary_path))
+            self.processor = SentencePieceProcessor(model_file=str(vocabulary_path_model))
             self.backend = "sentencepiece"
             self.bos_id = self.processor.bos_id()
             self.eos_id = self.processor.eos_id()
         else:
-            raise NotImplementedError
+            # Qwen3 Fix: If neither is found, look for tiktoken files or specialized Qwen configs
+            # For now, we point specifically to the error to avoid the generic NotImplementedError
+            raise FileNotFoundError(
+                f"Could not find 'tokenizer.json' or 'tokenizer.model' in {checkpoint_dir}. "
+                "Ensure the Qwen3 tokenizer files are present in the checkpoint directory."
+            )
+        
 
         # NOTE: A temporary fix until it's resolved on Tokenizers side.
         # LlaMA tokenizer strips leading spaces if to decode a single token at a time.
@@ -68,6 +55,40 @@ class Tokenizer:
         if (config_path := checkpoint_dir / "tokenizer_config.json").is_file():
             with open(config_path, encoding="utf-8") as fp:
                 self.apply_decoding_fix = "LlamaTokenizer" in json.load(fp)["tokenizer_class"]
+
+
+    def _load_special_token_ids(self, checkpoint_dir: Path) -> None:
+        """
+        Helper to find BOS/EOS IDs from various config files.
+        Critical for Qwen3 which often maps EOS to <|im_end|> or <|endoftext|>.
+        """
+        # Default fallback for Qwen
+        default_eos_token = "<|endoftext|>"
+        
+        # 1. Try tokenizer_config.json
+        config_path = checkpoint_dir / "tokenizer_config.json"
+        if config_path.is_file():
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+                
+            bos_token = config.get("bos_token")
+            eos_token = config.get("eos_token") or config.get("pad_token")
+
+            if isinstance(bos_token, dict): bos_token = bos_token.get("content")
+            if isinstance(eos_token, dict): eos_token = eos_token.get("content")
+
+            if bos_token: self.bos_id = self.token_to_id(bos_token)
+            if eos_token: self.eos_id = self.token_to_id(eos_token)
+
+        # 2. Final Fallback if still None
+        if self.eos_id is None:
+            try:
+                self.eos_id = self.token_to_id(default_eos_token)
+            except ValueError:
+                self.eos_id = 0 # Safe default for most BPE
+        
+        if self.bos_id is None:
+            self.bos_id = self.eos_id # Qwen often uses same token for both
 
     @property
     def vocab_size(self) -> int:

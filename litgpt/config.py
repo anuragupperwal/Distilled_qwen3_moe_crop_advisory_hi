@@ -7,7 +7,7 @@ import yaml
 from typing_extensions import Self
 
 configs: List[dict] = []
-name_to_config: Dict[str, dict] = {}
+name_to_config: dict[str, dict] = {}
 
 def find_multiple(n: int, k: int) -> int:
     """Utility function for finding the nearest value to n which is a multiple of k.
@@ -275,7 +275,7 @@ qwen_3_configs = [
     dict(
         name="Qwen3-14B",
         hf_config=dict(org="Qwen", name="Qwen3-14B"),
-        block_size=40960,
+        block_size=32768,
         vocab_size=151643,
         padded_vocab_size=151936,
         n_layer=40,
@@ -293,9 +293,31 @@ qwen_3_configs = [
         norm_qk=True,
     ),
     dict(
+        name="Qwen3-0.6B-Dense",
+        hf_config=dict(org="Qwen", name="Qwen3-0.6B"),
+        block_size=32768,
+        vocab_size=151643,
+        padded_vocab_size=151936,
+        n_layer=28,
+        n_head=16,
+        n_embd=1024,
+        n_query_groups=8,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=3072,
+        moe_intermediate_size=3072,
+        norm_eps=1e-6,
+        rope_base=1000000,
+        head_size=128,
+        norm_qk=True,
+    ),
+    dict(
         name="Qwen3-0.6B-MoE",
         hf_config=dict(org="Qwen", name="Qwen3-0.6B"),
-        block_size=40960,
+        block_size=32768,
         vocab_size=151643,
         padded_vocab_size=151936,
         n_layer=28,
@@ -313,8 +335,8 @@ qwen_3_configs = [
         rope_base=1000000,
         head_size=128,
         norm_qk=True,
-        n_expert=1,
-        n_expert_per_token=1,
+        n_expert=8,
+        n_expert_per_token=2,
     ),
 ]
 configs.extend(qwen_3_configs)
@@ -322,6 +344,9 @@ configs.extend(qwen_3_configs)
 #2. Update the name_to_config mapping (Crucial for discovery)
 # This ensures that Config.from_name("Qwen3-14B") works.
 name_to_config.update({c["name"]: c for c in qwen_3_configs})
+
+
+
 
 
 

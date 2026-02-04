@@ -1,14 +1,17 @@
 import importlib.util
 import os
+import huggingface_hub._snapshot_download as download
+import huggingface_hub.constants as constants
+
+from huggingface_hub import snapshot_download
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from litgpt.config import configs
-from litgpt.scripts.convert_hf_checkpoint import convert_hf_checkpoint
+from scripts.convert_hf_checkpoint import convert_hf_checkpoint
 from litgpt.utils import _HF_TRANSFER_AVAILABLE, _SAFETENSORS_AVAILABLE
 from argparse import ArgumentParser
-
 
 def download_from_hub(
     repo_id: str,
@@ -51,7 +54,6 @@ def download_from_hub(
         )
         return
 
-    from huggingface_hub import snapshot_download
 
     if importlib.util.find_spec("hf_transfer") is None:
         print(
@@ -71,14 +73,14 @@ def download_from_hub(
         else:
             raise ValueError(f"Couldn't find weight files for {repo_id}")
 
-    import huggingface_hub._snapshot_download as download
-    import huggingface_hub.constants as constants
 
-    previous = constants.HF_HUB_ENABLE_HF_TRANSFER
+
+    previous = getattr(constants, "HF_HUB_ENABLE_HF_TRANSFER", False)
     if _HF_TRANSFER_AVAILABLE and not previous:
         print("Setting HF_HUB_ENABLE_HF_TRANSFER=1")
-        constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        download.HF_HUB_ENABLE_HF_TRANSFER = True
+        setattr(constants, "HF_HUB_ENABLE_HF_TRANSFER", True)
+        if hasattr(download, "HF_HUB_ENABLE_HF_TRANSFER"):
+            download.HF_HUB_ENABLE_HF_TRANSFER = True
 
     directory = checkpoint_dir / repo_id
     with gated_repo_catcher(repo_id, access_token):
@@ -89,8 +91,11 @@ def download_from_hub(
             token=access_token,
         )
 
-    constants.HF_HUB_ENABLE_HF_TRANSFER = previous
-    download.HF_HUB_ENABLE_HF_TRANSFER = previous
+    if hasattr(constants, "HF_HUB_ENABLE_HF_TRANSFER"):
+        constants.HF_HUB_ENABLE_HF_TRANSFER = previous
+    if hasattr(download, "HF_HUB_ENABLE_HF_TRANSFER"):
+        download.HF_HUB_ENABLE_HF_TRANSFER = previous
+
 
     if convert_checkpoint and not tokenizer_only:
         print("Converting checkpoint files to LitGPT format.")

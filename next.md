@@ -8,13 +8,22 @@ You need the raw materials: the **Teacher** (to learn from) and the **Dense Base
 
 Run these commands in your terminal (assuming you are in the `litgpt-moe-project` root):
 
+
+pip install -e .
+
+
+
 ```bash
 # 1. Download the Student Base (Qwen2.5-0.5B or Qwen1.5-0.5B are closest to 0.6B in LitGPT naming)
 # Note: Ensure you pick the model matching your config's "intermediate_size=3072"
-python scripts/download.py --repo_id Qwen/Qwen3-0.6B
+
+#python scripts/download.py --repo_id Qwen/Qwen3-0.6B
+(works)
+python -m scripts.download --repo_id Qwen/Qwen3-0.6B --model_name Qwen3-0.6B-Dense  # run as module
 
 # 2. Download the Teacher (Qwen1.5-14B or similar)
-python scripts/download.py --repo_id Qwen/Qwen3-14B
+#python scripts/download.py --repo_id Qwen/Qwen3-14B
+python -m scripts.download --repo_id Qwen/Qwen3-14B
 
 # 3. Convert them to LitGPT format (auto-converted when downloaded) (if not auto-converted)
 python scripts/convert_hf_checkpoint.py --checkpoint_dir checkpoints/Qwen/Qwen3-0.6B
@@ -34,7 +43,7 @@ python -m scripts.upcycle_moe
 
 ```
 
-* **Input:** It reads `checkpoints/Qwen/Qwen1.5-0.5B/lit_model.pth`.
+* **Input:** It reads `checkpoints/Qwen/Qwen3-0.6B/lit_model.pth`.
 * **Process:** It clones the MLP layer 8 times (with jitter) and initializes the Router.
 * **Output:** It creates `checkpoints/Qwen/Qwen3-0.6B-moe/lit_model.pth`.
 

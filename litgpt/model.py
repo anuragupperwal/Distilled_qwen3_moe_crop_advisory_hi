@@ -15,7 +15,7 @@ from typing_extensions import Self
 
 from litgpt.config import Config
 from scripts.convert_hf_checkpoint import qkv_reassemble
-
+from torch.utils.checkpoint import checkpoint
 
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:
@@ -84,7 +84,8 @@ class GPT(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        return_features: bool = False, # NEW: Flag for distillation
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
         positions smaller than entries in `input_pos`. For efficiency, pass
@@ -136,21 +137,20 @@ class GPT(nn.Module):
                 # we get if input_pos has a batch dimension
                 mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
             if input_pos_maxp1 is not None:
-                # Shorten final dimension so it just covers all `input_pos` entries
-                if input_pos_maxp1 > self.max_seq_length:
-                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
                 mask = mask[..., :input_pos_maxp1]
         else:
             # unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
             sin = self.sin[:T].unsqueeze(0)
-            # `cos`, `sin` have shape (1, T, config.rope_n_elem)
-            mask = None  # defaults to causal mask
+            mask = None  
             input_pos_maxp1 = None
 
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
+
+
+        hidden_states = [] # Container for CKA features
 
         for block_idx, block in enumerate(self.transformer.h):
             if self.config.rope_indices is not None:
@@ -164,17 +164,42 @@ class GPT(nn.Module):
                 )
             else:
                 x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        
+            if return_features:
+                hidden_states.append(x)
+
         x = self.transformer.ln_f(x)
+
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
             if self.config.final_logit_softcapping is not None
             else nn.Identity()
         )
+
         if lm_head_chunk_size > 0:
-            # chunk the lm head logits to reduce the peak memory used by autograd
-            return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
+            # Support for chunked logits (useful for saving VRAM on H100)
+            logits = [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
         else:
-            return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+            logits = clamp_head(self.lm_head(x))
+
+        if return_features:
+            return logits, hidden_states 
+        return logits
+
+
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Enables gradient checkpointing for the model.
+        This is critical for training the 0.6B Student alongside the 14B Teacher 
+        on a single H100 80GB.
+        """
+        self.gradient_checkpointing = True
+        # Set the attribute on all transformer blocks
+        for block in self.transformer.h:
+            block.gradient_checkpointing = True
+    
+
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -217,6 +242,8 @@ class GPT(nn.Module):
             extra_config=extra_config,
             rope_local_base_freq=self.config.rope_local_base_freq,
         )
+
+    
 
     def set_kv_cache(
         self,
@@ -290,6 +317,8 @@ class Block(nn.Module):
         )
 
         self.config = config
+        self.gradient_checkpointing = False 
+
 
     def forward(
         self,
@@ -322,19 +351,26 @@ class Block(nn.Module):
         """
 
         # Standard Residual Connection structure
-        x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
-        attention_output = self.post_attention_norm(attention_output)
+        def custom_forward(x_in):
+            x_normed = self.norm_1(x_in)
+            attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+            attention_output = self.post_attention_norm(attention_output)
 
-        if self.config.parallel_residual:
-            if not self.config.shared_attention_norm:
-                x_normed = self.norm_2(x)
-            x = attention_output + x
+            if self.config.parallel_residual:
+                if not self.config.shared_attention_norm:
+                    x_normed = self.norm_2(x_in)
+                x_res = attention_output + x_in
+            else:
+                x_res = attention_output + x_in
+                x_normed = self.norm_2(x_res)
+
+            return self.post_mlp_norm(self.mlp(x_normed)) + x_res
+
+        # Check whether to use gradient checkpointing
+        if self.gradient_checkpointing and self.training:
+            return checkpoint(custom_forward, x, use_reentrant=False)
         else:
-            x = attention_output + x
-            x_normed = self.norm_2(x)
-
-        return self.post_mlp_norm(self.mlp(x_normed)) + x
+            return custom_forward(x)
 
 
 class CausalSelfAttention(nn.Module):
@@ -576,9 +612,15 @@ class CausalSelfAttention(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> "KVCache":
-        v_shape = (batch_size, self.config.n_head, max_seq_length, self.config.v_head_dim)
-        k_shape = (batch_size, self.config.n_head, max_seq_length, self.config.qk_head_dim)
+        head_dim = self.config.head_size
+        # 'n_query_groups' for GQA 
+        n_kv_heads = self.config.n_query_groups
+        
+        v_shape = (batch_size, n_kv_heads, max_seq_length, head_dim)
+        k_shape = (batch_size, n_kv_heads, max_seq_length, head_dim)
+        
         return KVCache(k_shape, v_shape, device=device, dtype=dtype)
+
 
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:
@@ -615,8 +657,6 @@ class LLaMAMoE(nn.Module):
         self.gate = (
             nn.Linear(config.n_embd, config.n_expert, bias=False)
         )
-        # NOTE: For upcycling, ensure 'moe_intermediate_size' in config matches the dense model's 'intermediate_size'
-
         self.experts = nn.ModuleList(
             LLaMAMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.n_expert)
         )
@@ -625,29 +665,42 @@ class LLaMAMoE(nn.Module):
                 config, intermediate_size=config.moe_intermediate_size * config.n_shared_expert
             )
         self.config = config
+        self.last_expert_outputs = None 
+        self.last_indices = None 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Derived from: https://github.com/mistralai/mistral-src/blob/b46d6/moe_one_file_ref.py#L203-L219
-        See also figure 1 in https://arxiv.org/abs/2211.15841
-        """
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
         residual_x = x.clone()
-        x = x.view(-1, C)  # (B*T, C)
-        router = self.gate(x)  # (B*T, n_expert)
-        probs, indices = torch.topk(router, self.config.n_expert_per_token)  # (B*T, n_expert_per_token)
+        x_flat = x.view(-1, C)
+        router = self.gate(x_flat)
+        
+        # Capture Top-K indices
+        probs, indices = torch.topk(router, self.config.n_expert_per_token)
+        
+        # Store indices during training to check for Expert Collapse
+        if self.training:
+            self.last_indices = indices.detach() # Detach to save memory
+            
         probs = probs.softmax(dim=1, dtype=torch.float).to(dtype=x.dtype)
 
         if self.config.routed_scaling_factor != 1.0:
             probs = probs * self.config.routed_scaling_factor
+            
         masks = indices.unsqueeze(-1) == torch.arange(self.config.n_expert, device=x.device)
-        masks = masks.permute(2, 0, 1)  # (n_expert, B*T, n_expert_per_token)
-        y = torch.zeros_like(x)  # (B*T, C)
+        masks = masks.permute(2, 0, 1)
+        y = torch.zeros_like(x_flat)
+
+        current_expert_activations = [] 
 
         for mask, expert in zip(masks, self.experts):
-            token_idx, expert_idx = torch.where(mask)
-            if token_idx.numel() > 0: # Performance optimization
-                y[token_idx] += probs[token_idx, expert_idx, None] * expert(x[token_idx])
+            token_idx, top_k_idx = torch.where(mask)
+            if token_idx.numel() > 0:
+                weighted_out = probs[token_idx, top_k_idx, None] * expert(x_flat[token_idx])
+                y[token_idx] += weighted_out 
+                if self.training:
+                    current_expert_activations.append(weighted_out)
+
+        self.last_expert_outputs = current_expert_activations 
 
         y = y.view(B, T, C)
         if self.config.n_shared_expert:
