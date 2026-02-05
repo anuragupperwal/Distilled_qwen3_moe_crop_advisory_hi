@@ -20,4 +20,9 @@ hf_transfer
 bitsandbytes 
 accelerate
 seaborn
-matplotlib 
+
+evaluate 
+bert_score 
+rouge_score 
+nltk 
+sacrebleu

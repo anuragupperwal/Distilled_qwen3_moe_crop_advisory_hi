@@ -3,7 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 import csv
+import json
+import uuid
 
+from datetime import datetime
 from pathlib import Path
 from torch.utils.data import DataLoader
 from litgpt.tokenizer import Tokenizer 
@@ -15,19 +18,67 @@ from agri_data import AgriDataset
 from plot_specialization import plot_cka_heatmap
 
 
+#config
+
+RUN_TAG = "run_test"  # <--- EDIT THIS PER RUN
+
+DISTILL_CONFIG = {
+    "alpha": 0.5,
+    "lambda": 0.5,  
+    "beta": 0.2, 
+    "gamma": 1.5, 
+    "T": 2.0 
+}
+MAX_SEQ_LENGTH = 3072
+BATCH_SIZE = 2
+ACCUMULATE_GRAD_STEPS = 3  # 1 * 4 = Effective Batch Size 4 (Better stability)
+
+# Generate a short 4-char unique ID (e.g., 'A9D2') to prevent overwrites
+short_id = uuid.uuid4().hex[:6].upper()
+run_name = f"{RUN_TAG}_{short_id}"
+
+OUTPUT_ROOT = Path(f"outputs/{run_name}")
+CHECKPOINT_ROOT = Path(f"checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/{run_name}")
+
+# Create directories
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
+(OUTPUT_ROOT / "audits").mkdir(exist_ok=True)
+
+print(f"Starting Run: {run_name}")
+print(f"Output Dir:   {OUTPUT_ROOT}")
+
+# --- 3. SAVE FULL CONFIG (The "Black Box" Recorder) ---
+# We save the numbers here, so we don't need them in the filename.
+config_path = OUTPUT_ROOT / "experiment_config.json"
+experiment_settings = {
+    "run_name": run_name,
+    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    **DISTILL_CONFIG,
+    "max_seq_length": MAX_SEQ_LENGTH,
+    "batch_size": BATCH_SIZE,
+    "accum_steps": ACCUMULATE_GRAD_STEPS,
+    "dataset": "agri_hi_train.parquet"
+}
+with open(config_path, 'w') as f:
+    json.dump(experiment_settings, f, indent=4)
+print(f"Parameters saved to: {config_path}")
+
+
+
 class LossLogger:
-    def __init__(self, file_path="outputs/training_log.csv"):
-        self.file_path = Path(file_path)
+    def __init__(self, log_dir="outputs/training_log.csv"):
+        self.file_path = Path(log_dir)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.headers = ["step", "total_loss", "kl_loss", "cka_feat_loss", "diversity_loss", "max_expert_load"]
         with open(self.file_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(self.headers)
 
-    def log(self, step, total, kl, cka, div, load):
+    def log(self, step, total, kl, ce, cka, div, load):
         with open(self.file_path, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([step, f"{total:.6f}", f"{kl:.6f}", f"{cka:.6f}", f"{div:.6f}", f"{load:.4f}"])
+            writer.writerow([step, f"{total:.6f}", f"{kl:.6f}", f"{ce:.6f}", f"{cka:.6f}", f"{div:.6f}", f"{load:.4f}"])
 
 
 #CKA Loss
@@ -68,11 +119,10 @@ def audit_expert_specialization(student, cka_fn, batch, step):
     
     audit_input = batch[0][:2].to(device) 
 
-    save_dir = Path("outputs/audits")
-    save_dir.mkdir(parents=True, exist_ok=True)
+    save_dir = OUTPUT_ROOT / "audits"
     matrix_path = save_dir / f"cka_matrix_step_{step}.pth"
     
-    print(f"\n--- 📊 Step {step}: Expert Specialization Audit ---")
+    print(f"\nStep {step}: Expert Specialization Audit ")
     
     # Extract Expert Logic - target a specific layer - for the thesis chart
     target_layer_idx = student.config.n_layer // 2
@@ -108,21 +158,23 @@ def audit_expert_specialization(student, cka_fn, batch, step):
 
 def train_distill(
     student_path="checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth",
-    teacher_path="checkpoints/Qwen/Qwen3-14B/lit_model.pth",
+    teacher_path="checkpoints/Qwen/Qwen3-8B/lit_model.pth",
     data_loader=None
 ):
     device = torch.device("cuda") 
-    DISTILL_CONFIG = {
-        "alpha": 1.0, "beta": 0.2, "gamma": 1.5, "T": 2.0 
-    }
     logger = LossLogger()
 
     tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B")
-    dataset = AgriDataset(data_path="data/agri_hi_train.parquet", tokenizer=tokenizer, max_seq_length=4096)
-    data_loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2)
+    dataset = AgriDataset(
+            data_path="data/agri_hi_train.parquet", 
+            tokenizer=tokenizer, 
+            max_seq_length=MAX_SEQ_LENGTH 
+        )
 
-    print("Loading 14B Teacher in BF16...")
-    teacher = GPT(Config.from_name("Qwen3-14B")).to(device, dtype=torch.bfloat16) 
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+    print("Loading 8B Teacher in BF16...")
+    teacher = GPT(Config.from_name("Qwen3-8B")).to(device, dtype=torch.bfloat16) 
     teacher.load_state_dict(torch.load(teacher_path, mmap=True, weights_only=True), strict=False)
     teacher.eval()
     
@@ -135,14 +187,16 @@ def train_distill(
     # Enable Gradient Checkpointing on Student to save VRAM, critical for the H100 80GB when running two models
     student.gradient_checkpointing_enable()
 
-    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=1e-4) # 8-bit AdamW saves ~2GB
+    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=2e-5) # 8-bit AdamW saves ~2GB
     cka_fn = LinearCKALoss()
 
     # Layer Mapping (28 student layers -> 40 teacher layers)
-    mapping = {s_i: int(s_i * (40-1) / (28-1)) for s_i in range(28)}
+    mapping = {s_i: int(s_i * (32-1) / (28-1)) for s_i in range(28)}
 
     n_experts = student.config.n_expert
     n_active = student.config.n_expert_per_token
+    
+    optimizer.zero_grad() 
 
     for batch_idx, (input_ids, loss_mask) in enumerate(tqdm(data_loader)):
         input_ids = input_ids.to(device)
@@ -157,32 +211,38 @@ def train_distill(
 
         # LOSS A: Soft Logit Distillation (With Masking)
         # We calculate KL Divergence only on the unmasked tokens (Thoughts + Advisory)
-        
-        T = 2.0 # Distillation Temperature
+
+        T = DISTILL_CONFIG["T"] # Distillation Temperature
         # Shapes: [B, T, Vocab]
         student_log_probs = F.log_softmax(s_logits / DISTILL_CONFIG["T"], dim=-1)
         teacher_probs = F.softmax(t_logits / DISTILL_CONFIG["T"], dim=-1)
-
         # Standard KLDiv reduces to a scalar, so we need to implement manual reduction for masking
         kl_loss_pointwise = F.kl_div(student_log_probs, teacher_probs, reduction="none", log_target=False)
         # kl_loss_pointwise shape: [B, T, Vocab] -> Sum over vocab -> [B, T]
         kl_loss_per_token = kl_loss_pointwise.sum(dim=-1) 
-
         # Apply Mask
         # loss_mask is [B, T], 1 for learnable tokens, 0 for prompt
         active_loss = (kl_loss_per_token * loss_mask).sum() / (loss_mask.sum() + 1e-6)
         loss_kl = active_loss * (DISTILL_CONFIG["T"]**2)
 
-        # loss_kl = F.kl_div(
-        #     F.log_softmax(s_logits / DISTILL_CONFIG["T"], dim=-1),
-        #     F.softmax(t_logits / DISTILL_CONFIG["T"], dim=-1),
-        #     reduction="batchmean"
-        # ) * (DISTILL_CONFIG["T"]**2)
 
-        # LOSS B: Feature CKA Distillation 
+        #LOSS B: Cross-Entropy 
+        # Shift targets: logits[0] predicts input_ids[1]
+        shift_logits = s_logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        shift_mask = loss_mask[..., 1:].contiguous()
+
+        # Calculate standard CE
+        ce_loss_pointwise = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
+        ce_loss_pointwise = ce_loss_pointwise.view(shift_labels.size())
+        # Apply mask
+        loss_ce = (ce_loss_pointwise * shift_mask).sum() / (shift_mask.sum() + 1e-6)
+
+
+        # LOSS C: Feature CKA Distillation 
         loss_cka = sum(cka_fn(s_features[s], t_features[t]) for s, t in mapping.items()) / len(mapping)
 
-        # LOSS C: Expert Diversity (The Research Key) 
+        # LOSS D: Expert Diversity (The Research Key) 
         loss_diversity = 0
         moe_layers = [h.mlp for h in student.transformer.h if hasattr(h.mlp, 'experts')]
         
@@ -204,14 +264,22 @@ def train_distill(
 
         # Total Loss 
         total_loss = (DISTILL_CONFIG["alpha"] * loss_kl) + \
+                     (DISTILL_CONFIG["lambda"] * loss_ce) + \
                      (DISTILL_CONFIG["beta"] * loss_cka) + \
                      (DISTILL_CONFIG["gamma"] * loss_diversity)        
-        total_loss.backward()
-        # Gradient Clipping for MoE Stability
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
 
+
+        loss_scaled = total_loss / ACCUMULATE_GRAD_STEPS
+        loss_scaled.backward()
+
+        # Step Optimizer ONLY every 'N' steps
+        if (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0:
+            # Gradient Clipping for MoE Stability
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        #logging
         all_indices = torch.cat([layer.mlp.last_indices for layer in student.transformer.h if hasattr(layer.mlp, 'last_indices')], dim=0)
         max_load = (torch.bincount(all_indices.view(-1), minlength=n_experts).float() / all_indices.numel()).max().item()
 
@@ -220,38 +288,32 @@ def train_distill(
         #  THE AUDIT (Every 500 Steps) 
         if batch_idx % 500 == 0 and batch_idx > 0:
             audit_expert_specialization(student, cka_fn, [input_ids], batch_idx)
+            torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{batch_idx}.pth")
+
 
         if batch_idx % 10 == 0:
-            print(f"Step {batch_idx} | Total: {total_loss:.4f} | Max Load: {max_load:.2%}")
+            print(f"Step {batch_idx} | Total_Loss: {total_loss:.4f} | Max_Load: {max_load:.2%}")
 
         # Intermediate Saving
         if batch_idx % 500 == 0 and batch_idx > 0:
-            checkpoint_dir = Path("checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled")
-            checkpoint_dir.mkdir(parents=True, exist_ok=True) # Ensure the full folder exists
-            torch.save(student.state_dict(), checkpoint_dir / f"step-{batch_idx}.pth")
+            torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{batch_idx}.pth")
 
-    # Define a separate output path
-    out_dir = Path("checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled")
-    out_dir.mkdir(parents=True, exist_ok=True)
     # Save the final student state separately
-    final_path = out_dir / "lit_model.pth"
+    final_path = CHECKPOINT_ROOT / "lit_model.pth"
     torch.save(student.state_dict(), final_path)
-    # audit_expert_specialization(student, cka_fn, [input_ids], batch_idx)
+    audit_expert_specialization(student, cka_fn, [input_ids], batch_idx)
 
 
     # Copy configuration files to make the model portable
     from litgpt.utils import copy_config_files
-    copy_config_files(Path("checkpoints/Qwen/Qwen3-0.6B"), out_dir)
-    print(f"✨ Distilled model saved to: {out_dir}")
+    copy_config_files(Path("checkpoints/Qwen/Qwen3-0.6B"), CHECKPOINT_ROOT)
+    print(f"✨ Distilled model saved to: {CHECKPOINT_ROOT}")
+
 
 
 
 if __name__ == "__main__":
     train_distill()
-
-
-
-
 
 
 

@@ -15,6 +15,8 @@ class AgriDataset(Dataset):
         # Load Parquet directly into a DataFrame
         self.df = pd.read_parquet(data_path)
         print(f"Loaded {len(self.df)} samples from {data_path}")
+        self.pad_id = tokenizer.eos_id
+
 
     def __len__(self):
         return len(self.df)
@@ -52,7 +54,7 @@ class AgriDataset(Dataset):
         # Format strings based on your column names
         # Using Hindi labels helps the model learn the semantic structure
         sys_text = f"<|system|>\n{row['system_instruction']}\n"
-        user_text = f"<|user|>\n{self.format_scenario(row['prompt'])}\n"
+        user_text = f"<|user|>\n{self.format_scenario(row['prompt'])}"
         thought_text = f"<|thought|>\n{row['thoughts']}\n"
         # Ensure advisory ends with EOS
         assistant_text = f"<|assistant|>\n{row['advisory']}" 
@@ -80,12 +82,13 @@ class AgriDataset(Dataset):
         else:
             # Pad to max_length (standard for batching)
             pad_len = self.max_seq_length - len(input_ids)
-            pad_tensor = torch.full((pad_len,), self.tokenizer.pad_id, dtype=torch.long, device=input_ids.device)
-            mask_pad = torch.zeros((pad_len,), dtype=torch.long, device=mask.device) # Mask padding
+            pad_tensor = torch.full((pad_len,), self.pad_id, dtype=torch.long, device=input_ids.device)
+            mask_pad = torch.zeros((pad_len,), dtype=torch.long, device=mask.device) 
             
             input_ids = torch.cat([input_ids, pad_tensor])
             mask = torch.cat([mask, mask_pad])
 
+            
         return input_ids, mask
     
 

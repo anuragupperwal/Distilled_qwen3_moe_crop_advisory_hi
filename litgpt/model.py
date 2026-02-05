@@ -186,7 +186,57 @@ class GPT(nn.Module):
             return logits, hidden_states 
         return logits
 
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_id=None):
+        """
+        Built-in generation loop for the GPT class.
+        """
+        import torch.nn.functional as F
+        
+        B, T = idx.shape
+        device = idx.device  # Get device from the input tensor
+        
+        # Cap length at model's block size
+        T_new = T + max_new_tokens
+        max_seq_length = min(T_new, self.config.block_size)
+        
+        # 1. Setup KV Cache (Check if method exists first to be safe)
+        if hasattr(self, 'set_kv_cache'):
+            self.set_kv_cache(batch_size=B, max_seq_length=max_seq_length, device=device)
+        
+        # 2. Prefill Phase: Process the prompt
+        input_pos = torch.arange(0, T, device=device)
+        logits = self(idx, input_pos=input_pos)
+        logits = logits[:, -1, :] # Last token logits
 
+        # 3. Decoding Phase
+        for i in range(max_new_tokens):
+            # Apply Temperature
+            if temperature > 0:
+                logits = logits / temperature
+            
+            # Apply Top-K
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            # Stop if EOS
+            if eos_id is not None and idx_next.item() == eos_id:
+                break
+
+            # Append
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            # 4. Forward pass for NEXT token (using Cache)
+            input_pos = torch.tensor([T + i], device=device, dtype=torch.long)
+            logits = self(idx_next, input_pos=input_pos)
+            logits = logits[:, -1, :]
+
+        return idx
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """

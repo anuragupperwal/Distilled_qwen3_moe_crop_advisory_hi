@@ -1,104 +1,164 @@
+import os
 import torch
-import torch.nn.functional as F
 import pandas as pd
+import evaluate
+import matplotlib.pyplot as plt
+import seaborn as sns  
+
 from tqdm import tqdm
 from litgpt.model import GPT
 from litgpt.config import Config
 from litgpt.tokenizer import Tokenizer
-from torcheval.metrics.text import Perplexity
-from nltk.translate.bleu_score import sentence_bleu
-from rouge_score import rouge_scorer
+from agri_data import AgriDataset
 
-# 1. SETUP
-device = torch.device("cuda")
-tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B-moe-initial")
-scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TEST_DATA_PATH = "data/test_part_003.parquet"
+NUM_SAMPLES = 10 
+MAX_NEW_TOKENS = 1024
 
-# Load Test Data (Ensure you have a separate test set or split your train)
-df = pd.read_parquet("data/agri_hi_train.parquet").sample(100, random_state=42)  # Using 100 samples for fast eval
-
-def load_model(path, config_name, dtype=torch.bfloat16):
-    print(f"Loading {config_name} from {path}...")
-    model = GPT(Config.from_name(config_name)).to(device, dtype=dtype)
-    # Allow loading with strict=False to handle potential missing keys in MoE
-    state_dict = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    return model
-
-def calculate_metrics(model, df):
-    ppl_metric = Perplexity()
-    rouge_l_scores = []
-    bleu_scores = []
-    
-    print("Running Generation & Scoring...")
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        # Format Input
-        prompt = f"स्थिति (Scenario):\n{row['prompt']}\n\n"
-        input_ids = tokenizer.encode(prompt, bos=True, eos=False).to(device)
-        
-        # 1. Perplexity Calculation (on the Ground Truth Answer)
-        target_text = f"विचार (Thinking):\n{row['thoughts']}\n\nपरामर्श (Advisory):\n{row['advisory']}"
-        target_ids = tokenizer.encode(target_text, bos=False, eos=True).to(device)
-        
-        # Feed full sequence to get logits
-        full_seq = torch.cat([input_ids, target_ids])
-        with torch.no_grad():
-            logits = model(full_seq.unsqueeze(0))
-        
-        # Shift logits and labels for PPL (Standard Auto-regressive loss)
-        shift_logits = logits[0, :-1, :].unsqueeze(0)
-        shift_labels = full_seq[1:].unsqueeze(0)
-        ppl_metric.update(shift_logits, shift_labels)
-        
-        # 2. Generation Quality (BLEU / ROUGE)
-        # Generate strictly: Max 200 tokens
-        gen_ids = model.generate(input_ids.unsqueeze(0), max_new_tokens=200, temperature=0.7, top_k=50)
-        gen_text = tokenizer.decode(gen_ids[0])
-        
-        # Extract just the advisory part for scoring (Simplified)
-        try:
-            generated_advisory = gen_text.split("परामर्श (Advisory):")[1].strip()
-            reference_advisory = row['advisory'].strip()
-            
-            # ROUGE
-            scores = scorer.score(reference_advisory, generated_advisory)
-            rouge_l_scores.append(scores['rougeL'].fmeasure)
-            
-            # BLEU
-            bleu_scores.append(sentence_bleu([reference_advisory.split()], generated_advisory.split()))
-        except IndexError:
-            # Model failed to follow format
-            rouge_l_scores.append(0.0)
-            bleu_scores.append(0.0)
-
-    return {
-        "Perplexity": ppl_metric.compute().item(),
-        "Avg_ROUGE_L": sum(rouge_l_scores) / len(rouge_l_scores),
-        "Avg_BLEU": sum(bleu_scores) / len(bleu_scores)
-    }
-
-# --- EVALUATION LOOP ---
-models_to_test = {
-    "Teacher (14B)": ("checkpoints/Qwen/Qwen3-14B/lit_model.pth", "Qwen3-14B"),
-    "Base Student": ("checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth", "Qwen3-0.6B-MoE"),
-    "Distilled Student": ("checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/lit_model.pth", "Qwen3-0.6B-MoE")
+MODELS = {
+    "1. Teacher (8B)":     ("checkpoints/Qwen/Qwen3-8B/lit_model.pth", "Qwen3-8B", "teacher"),
+    "2. Student (Base)":   ("checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth", "Qwen3-0.6B-moe-initial", "student"),
+    "3. Student (Mid)":    ("checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/run_test_434D09/step-500.pth", "Qwen3-0.6B-Agri-Distilled", "student"),
+    "4. Student (Final)":  ("checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/run_test_434D09/lit_model.pth", "Qwen3-0.6B-Agri-Distilled", "student")
 }
 
-results = []
-for name, (path, config) in models_to_test.items():
-    try:
-        model = load_model(path, config)
-        metrics = calculate_metrics(model, df)
-        metrics["Model"] = name
-        results.append(metrics)
-        del model # Free VRAM
-        torch.cuda.empty_cache()
-    except Exception as e:
-        print(f"Skipping {name}: {e}")
+# Load Metrics
+bleu = evaluate.load("bleu")
+rouge = evaluate.load("rouge")
+bertscore = evaluate.load("bertscore")
+meteor = evaluate.load("meteor")
 
-# Save Report
-results_df = pd.DataFrame(results)
-print("\n--- 🏆 Final Performance Comparison ---")
-print(results_df)
-results_df.to_csv("outputs/model_comparison_report.csv", index=False)
+def generate_response(model, tokenizer, prompt, device):
+    encoded = tokenizer.encode(prompt, device=device)
+    prompt_len = encoded.size(0)
+    generated = model.generate(
+        encoded.unsqueeze(0), 
+        max_new_tokens=MAX_NEW_TOKENS, 
+        temperature=0.1, 
+        top_k=1, 
+        eos_id=tokenizer.eos_id
+    )
+    output_ids = generated[0][prompt_len:]
+    return tokenizer.decode(output_ids)
+
+def plot_metrics(df, save_path="outputs/model_comparison.png"):
+    """
+    Generates a grouped bar chart comparing models across all metrics.
+    """
+    # Set style
+    sns.set_theme(style="whitegrid")
+    
+    # Transform data for plotting (Melt the dataframe)
+    # We want columns: [Model, Metric, Score]
+    df_melted = df.melt(id_vars="Model", var_name="Metric", value_name="Score")
+    
+    plt.figure(figsize=(12, 6))
+    
+    # Create Grouped Bar Chart
+    chart = sns.barplot(
+        data=df_melted,
+        x="Metric",
+        y="Score",
+        hue="Model",
+        palette="viridis", # Good color scheme for research
+        edgecolor="black"
+    )
+    
+    # Add values on top of bars
+    for container in chart.containers:
+        chart.bar_label(container, fmt='%.2f', padding=3, fontsize=9)
+
+    plt.title("Model Performance Comparison (Distillation)", fontsize=16, pad=20)
+    plt.ylabel("Score", fontsize=12)
+    plt.xlabel("Metric", fontsize=12)
+    plt.legend(title="Model", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.ylim(0, 1.1) # Assuming scores are 0-1 (except maybe PPL)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    print(f"Plot saved to {save_path}")
+    plt.close()
+
+def run_evaluation():
+    try:
+        tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B-moe-initial")
+    except:
+        tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B") 
+        
+    df = pd.read_parquet(TEST_DATA_PATH).sample(NUM_SAMPLES, random_state=42)
+    
+    results = []
+
+    dummy_dataset = AgriDataset(TEST_DATA_PATH, tokenizer, max_seq_length=128)
+
+    # Iterate through models
+    for model_name, (ckpt_path, config_name, arch_type) in MODELS.items():
+        print(f"\nEvaluating: {model_name}...")
+        
+        # Load Model Logic 
+        config = Config.from_name(config_name)
+        if "8B" in config_name:
+            config.n_embd = 4096 
+            config.n_head = 32
+            config.intermediate_size = 12288
+
+        model = GPT(config)
+        # Ensure strict=False handles the loading
+        model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE, weights_only=True), strict=False)
+        model.to(DEVICE).eval()
+        
+        predictions = []
+        references = []
+        
+        for _, row in tqdm(df.iterrows(), total=len(df)):
+            formatted_scenario = dummy_dataset.format_scenario(row['prompt'])
+            prompt = f"<|system|>\n{row['system_instruction']}\n<|user|>\n{formatted_scenario.strip()}\n<|thought|>\n"
+            reference = row['advisory']
+            
+            try:
+                pred = generate_response(model, tokenizer, prompt, DEVICE)
+            except Exception as e:
+                print(f"Error: {e}")
+                pred = ""
+                
+            predictions.append(pred)
+            references.append(reference)
+            
+        print(f"Computing scores for {model_name}...")
+        
+        b_score = bleu.compute(predictions=predictions, references=references)
+        r_score = rouge.compute(predictions=predictions, references=references)
+        bs_score = bertscore.compute(predictions=predictions, references=references, lang="hi")
+        m_score = meteor.compute(predictions=predictions, references=references)
+
+        scores = {
+            "Model": model_name,
+            "BLEU": b_score['bleu'],
+            "ROUGE-1": r_score['rouge1'],
+            "ROUGE-L": r_score['rougeL'],
+            "BERTScore_F1": sum(bs_score['f1']) / len(bs_score['f1']),
+            "METEOR": m_score['meteor']
+        }
+        results.append(scores)
+        
+        del model
+        torch.cuda.empty_cache()
+
+    results_df = pd.DataFrame(results)
+    
+    print("\nFinal Evaluation Results ")
+    print(results_df.to_markdown(index=False))
+    
+    os.makedirs("outputs", exist_ok=True)
+    results_df.to_csv("outputs/model_comparison_metrics.csv", index=False)
+    print("Saved to outputs/model_comparison_metrics.csv")
+    
+    plot_metrics(results_df, save_path="outputs/model_comparison_plot.png")
+
+if __name__ == "__main__":
+    run_evaluation()
+
+
+
+

@@ -24,6 +24,7 @@ python -m scripts.download --repo_id Qwen/Qwen3-0.6B --model_name Qwen3-0.6B-Den
 # 2. Download the Teacher (Qwen1.5-14B or similar)
 #python scripts/download.py --repo_id Qwen/Qwen3-14B
 python -m scripts.download --repo_id Qwen/Qwen3-14B
+python -m scripts.download --repo_id Qwen/Qwen3-8B
 
 # 3. Convert them to LitGPT format (auto-converted when downloaded) (if not auto-converted)
 python scripts/convert_hf_checkpoint.py --checkpoint_dir checkpoints/Qwen/Qwen3-0.6B

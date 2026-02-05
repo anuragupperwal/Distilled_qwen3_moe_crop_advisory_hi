@@ -2,7 +2,7 @@
 #SBATCH --job-name=agri_distill
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1
