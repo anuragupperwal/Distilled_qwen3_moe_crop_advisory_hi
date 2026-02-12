@@ -10,10 +10,10 @@ from torch.utils.data import DataLoader
 
 def run_sanity_check():
     # 1. Setup - Use the directory, not just the file
-    checkpoint_dir = Path("checkpoints/Qwen/Qwen3-0.6B")
+    checkpoint_dir = Path("checkpoints/Qwen/Qwen3-0.6B-moe-init")
     
     # Load config to get the correct tokenizer settings
-    config = Config.from_name("Qwen3-0.6B")
+    config = Config.from_name("Qwen3-0.6B-MoE")
     
     print(f"Initializing Tokenizer from: {checkpoint_dir}")
     # Using the directory allows the tokenizer to find both tokenizer.json and any config files

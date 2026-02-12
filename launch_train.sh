@@ -10,8 +10,8 @@ export NCCL_IB_DISABLE=0
 export NCCL_DEBUG=INFO
 
 # 3. Model and Data Paths
-STUDENT_PATH="checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth"
-TEACHER_PATH="checkpoints/Qwen/Qwen3-14B/lit_model.pth"
+STUDENT_PATH="checkpoints/Qwen/Qwen3-0.6B-moe-init/lit_model.pth"
+TEACHER_PATH="checkpoints/Qwen/Qwen3-8B/lit_model.pth"
 DATA_PATH="data/agri_hi_train.parquet"
 
 # 4. Launch Training

@@ -1,7 +1,7 @@
 import torch
 from collections import defaultdict
 
-ckpt_path = "checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth"
+ckpt_path = "checkpoints/Qwen/Qwen3-0.6B-moe-init/lit_model.pth"
 # Use weights_only=True for security and speed
 state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 

@@ -16,7 +16,7 @@ from litgpt.utils import chunked_cross_entropy
 from tqdm import tqdm
 from agri_data import AgriDataset
 from plot_specialization import plot_cka_heatmap
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 #config
 
@@ -25,13 +25,13 @@ RUN_TAG = "run_test"  # <--- EDIT THIS PER RUN
 DISTILL_CONFIG = {
     "alpha": 0.5,
     "lambda": 0.5,  
-    "beta": 0.2, 
+    "beta": 1.0, 
     "gamma": 1.5, 
     "T": 2.0 
 }
 MAX_SEQ_LENGTH = 3072
 BATCH_SIZE = 2
-ACCUMULATE_GRAD_STEPS = 3  # 1 * 4 = Effective Batch Size 4 (Better stability)
+ACCUMULATE_GRAD_STEPS = 8  # 1 * 4 = Effective Batch Size 4 (Better stability)
 
 # Generate a short 4-char unique ID (e.g., 'A9D2') to prevent overwrites
 short_id = uuid.uuid4().hex[:6].upper()
@@ -70,7 +70,8 @@ class LossLogger:
     def __init__(self, log_dir="outputs/training_log.csv"):
         self.file_path = Path(log_dir)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.headers = ["step", "total_loss", "kl_loss", "cka_feat_loss", "diversity_loss", "max_expert_load"]
+        self.file_path = log_dir / "training_log.csv"
+        self.headers = ["step", "total_loss", "kl_loss", "ce_loss", "cka_loss", "div_loss", "max_load"]
         with open(self.file_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(self.headers)
@@ -117,7 +118,7 @@ def audit_expert_specialization(student, cka_fn, batch, step):
     device = next(student.parameters()).device
     # Use a small subset of the batch for the audit to save VRAM
     
-    audit_input = batch[0][:2].to(device) 
+    audit_input = batch[0][:2].to(device).long() 
 
     save_dir = OUTPUT_ROOT / "audits"
     matrix_path = save_dir / f"cka_matrix_step_{step}.pth"
@@ -157,12 +158,12 @@ def audit_expert_specialization(student, cka_fn, batch, step):
 
 
 def train_distill(
-    student_path="checkpoints/Qwen/Qwen3-0.6B-moe-initial/lit_model.pth",
+    student_path="checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/run_test_E86460/step-500.pth",
     teacher_path="checkpoints/Qwen/Qwen3-8B/lit_model.pth",
     data_loader=None
 ):
     device = torch.device("cuda") 
-    logger = LossLogger()
+    logger = LossLogger(OUTPUT_ROOT)
 
     tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B")
     dataset = AgriDataset(
@@ -190,16 +191,22 @@ def train_distill(
     optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=2e-5) # 8-bit AdamW saves ~2GB
     cka_fn = LinearCKALoss()
 
-    # Layer Mapping (28 student layers -> 40 teacher layers)
-    mapping = {s_i: int(s_i * (32-1) / (28-1)) for s_i in range(28)}
+    # Layer Mapping (teacher to student)
+    # mapping = {s_i: int(s_i * (32-1) / (28-1)) for s_i in range(28)}
+    n_student_layers = student.config.n_layer
+    n_teacher_layers = teacher.config.n_layer
+    print(f"Mapping {n_student_layers} Student layers -> {n_teacher_layers} Teacher layers")
+    mapping = {
+        s_i: int(s_i * (n_teacher_layers - 1) / (n_student_layers - 1)) 
+        for s_i in range(n_student_layers)
+    }
 
-    n_experts = student.config.n_expert
-    n_active = student.config.n_expert_per_token
-    
+
+    n_experts = student.config.n_expert    
     optimizer.zero_grad() 
 
     for batch_idx, (input_ids, loss_mask) in enumerate(tqdm(data_loader)):
-        input_ids = input_ids.to(device)
+        input_ids = input_ids.to(device).long()
         loss_mask = loss_mask.to(device)
 
         # 1. Teacher Forward (No Grads)
@@ -283,7 +290,7 @@ def train_distill(
         all_indices = torch.cat([layer.mlp.last_indices for layer in student.transformer.h if hasattr(layer.mlp, 'last_indices')], dim=0)
         max_load = (torch.bincount(all_indices.view(-1), minlength=n_experts).float() / all_indices.numel()).max().item()
 
-        logger.log(batch_idx, total_loss.item(), loss_kl.item(), loss_cka.item(), loss_diversity.item(), max_load)
+        logger.log(batch_idx, total_loss.item(), loss_kl.item(), loss_ce.item(), loss_cka.item(), loss_diversity.item(), max_load)
 
         #  THE AUDIT (Every 500 Steps) 
         if batch_idx % 500 == 0 and batch_idx > 0:
@@ -314,6 +321,9 @@ def train_distill(
 
 if __name__ == "__main__":
     train_distill()
+
+
+
 
 
 

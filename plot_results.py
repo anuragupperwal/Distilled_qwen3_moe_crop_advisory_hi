@@ -1,53 +1,124 @@
+    # Caption: "Figure 1(a): Training loss trajectory. The blue line (Total Loss) and orange dashed line (KL Loss) show the student successfully minimizing the divergence from the teacher's output distribution. A steep drop followed by stabilization indicates effective knowledge transfer."
+    # Caption: "Figure 1(b): Feature-level alignment using CKA Loss. This metric measures the similarity between the Teacher's hidden states and the Student's hidden states. The downward trend confirms the student is learning to replicate the teacher's internal reasoning process, not just the final answer."
+    # Caption: "Figure 1(c): Expert utilization over time. The red line tracks the load on the most active expert. Values hovering near the ideal 12.5% (dotted line) indicate that the router is effectively distributing tokens across all 8 experts, avoiding mode collapse where a single expert dominates."
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+import os
 
 # --- CONFIGURATION ---
-log_file = "outputs/training_log.csv"
-output_img = "outputs/training_plots.png"
+log_file = "outputs/1_run_test_51751D/training_log.csv"
+output_dir = "outputs/plots/" # Folder to save individual plots
+
+def smooth(scalars, weight=0.85):
+    """Exponential Moving Average for cleaner lines."""
+    if len(scalars) == 0: return []
+    last = scalars[0]
+    smoothed = []
+    for point in scalars:
+        smoothed_val = last * weight + (1 - weight) * point
+        smoothed.append(smoothed_val)
+        last = smoothed_val
+    return smoothed
 
 def plot_training_metrics():
     if not Path(log_file).exists():
         print(f"❌ Error: Log file not found at {log_file}")
         return
 
-    # Load Data
+    # 1. Load Data
     df = pd.read_csv(log_file)
-    print(f"Loaded {len(df)} steps from log.")
-
-    # Set Style
-    sns.set_theme(style="whitegrid")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    # --- Plot 1: Loss Convergence ---
-    sns.lineplot(data=df, x="step", y="total_loss", ax=axes[0], label="Total Loss", color="#1f77b4")
-    sns.lineplot(data=df, x="step", y="kl_loss", ax=axes[0], label="Distillation (KL) Loss", color="#ff7f0e", linestyle="--")
-    axes[0].set_title("Training Convergence")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_xlabel("Training Steps")
-    axes[0].legend()
-
-    # --- Plot 2: CKA Alignment ---
-    # Low value = High similarity to Teacher
-    sns.lineplot(data=df, x="step", y="cka_feat_loss", ax=axes[1], color="#2ca02c")
-    axes[1].set_title("Teacher-Student Alignment (CKA)")
-    axes[1].set_ylabel("Feature Distance (1 - CKA)")
-    axes[1].set_xlabel("Training Steps")
-
-    # --- Plot 3: MoE Expert Load ---
-    sns.lineplot(data=df, x="step", y="max_expert_load", ax=axes[2], color="#d62728")
-    axes[2].set_title("Expert Specialization Health")
-    axes[2].set_ylabel("Max Expert Load (%)")
-    axes[2].set_xlabel("Training Steps")
+    print(f"✅ Loaded {len(df)} steps.")
     
-    # Draw reference line for ideal load (assuming 8 experts, ~12.5% is perfectly balanced)
-    axes[2].axhline(y=0.15, color='gray', linestyle='--', alpha=0.7, label="Balanced Threshold (~15%)")
-    axes[2].legend()
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
 
-    plt.tight_layout()
-    plt.savefig(output_img, dpi=300)
-    print(f"✅ Plots saved successfully to: {output_img}")
+    # 2. Apply Smoothing
+    cols_to_smooth = ['total_loss', 'kl_loss', 'ce_loss', 'cka_loss', 'div_loss', 'max_load']
+    for col in cols_to_smooth:
+        if col in df.columns:
+            df[f'{col}_smooth'] = smooth(df[col])
+
+    # 3. Setup Research Style
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.5)
+
+    # PLOT 1: Optimization (Loss Convergence)
+    plt.figure(figsize=(8, 6))
+    
+    if 'total_loss' in df.columns:
+        sns.lineplot(data=df, x="step", y="total_loss_smooth", 
+                     label="Total Loss", color="#1f77b4", linewidth=3)
+    if 'kl_loss' in df.columns:
+        sns.lineplot(data=df, x="step", y="kl_loss_smooth", 
+                     label="Distillation (KL) Loss", color="#ff7f0e", linestyle="--", linewidth=2.5)
+    
+    plt.title("Optimization Convergence", fontweight='bold', pad=15)
+    plt.ylabel("Loss Value")
+    plt.xlabel("Training Steps")
+    plt.legend(frameon=True, loc='upper right')
+    plt.grid(True, which='major', linestyle='--', alpha=0.6)
+    
+    save_path_1 = os.path.join(output_dir, "1_optimization_convergence.png")
+    plt.savefig(save_path_1, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved: {save_path_1}")
+
+    # PLOT 2: Representation Alignment (CKA)
+    plt.figure(figsize=(8, 6))
+    
+    if 'cka_loss' in df.columns:
+        sns.lineplot(data=df, x="step", y="cka_loss_smooth", 
+                     color="#2ca02c", linewidth=3, label="Feature Alignment (CKA)")
+        
+        plt.title("Internal Representation Alignment", fontweight='bold', pad=15)
+        plt.ylabel("Feature Distance")
+        plt.xlabel("Training Steps")
+        plt.legend(frameon=True, loc='upper right')
+        plt.grid(True, which='major', linestyle='--', alpha=0.6)
+        
+        save_path_2 = os.path.join(output_dir, "2_feature_alignment.png")
+        plt.savefig(save_path_2, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Saved: {save_path_2}")
+    else:
+        print("⚠️ CKA Loss not found, skipping Plot 2.")
+
+    # PLOT 3: Router Health (Expert Load)
+    fig, ax1 = plt.subplots(figsize=(8, 6))
+    
+    if 'max_load' in df.columns:
+        sns.lineplot(data=df, x="step", y="max_load_smooth", ax=ax1,
+                     color="#d62728", linewidth=3, label="Max Expert Load")
+        
+        # Ideal Baseline
+        ax1.axhline(y=0.125, color='black', linestyle=':', linewidth=2, label="Ideal Balance (12.5%)")
+        
+        ax1.set_ylabel("Load Factor (0.0 - 1.0)", color="#d62728", fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor="#d62728")
+        ax1.set_xlabel("Training Steps")
+        ax1.set_title("MoE Routing Dynamics", fontweight='bold', pad=15)
+        
+        # Secondary Axis for Diversity Loss
+        if 'div_loss' in df.columns:
+            ax2 = ax1.twinx()
+            sns.lineplot(data=df, x="step", y="div_loss_smooth", ax=ax2,
+                         color="gray", alpha=0.5, linestyle="-.", linewidth=2, label="Diversity Loss")
+            ax2.set_ylabel("Auxiliary Loss", color="gray")
+            ax2.tick_params(axis='y', labelcolor="gray")
+            
+            # Combine legends
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines + lines2, labels + labels2, loc='center right', frameon=True)
+        else:
+            ax1.legend(loc='upper right', frameon=True)
+
+        save_path_3 = os.path.join(output_dir, "3_routing_dynamics.png")
+        plt.savefig(save_path_3, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Saved: {save_path_3}")
 
 if __name__ == "__main__":
     plot_training_metrics()
