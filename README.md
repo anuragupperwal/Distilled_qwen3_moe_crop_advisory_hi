@@ -199,6 +199,8 @@ Provides the visual proof of Expert Specialization for the thesis defense.
 
 ### Commands:
 
+* conda activate proj_agri_iitr
+
 * to run as package:
 pip install -e .
 

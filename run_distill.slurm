@@ -2,12 +2,12 @@
 #SBATCH --job-name=agri_distill
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:1
-#SBATCH --time=03:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
+#SBATCH --cpus-per-task=16
 
 # 1. Load Environment
 # We use the direct hook to ensure Conda works in non-interactive batch mode

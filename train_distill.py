@@ -5,22 +5,24 @@ import bitsandbytes as bnb
 import csv
 import json
 import uuid
+import os
 
 from datetime import datetime
 from pathlib import Path
+from tqdm import tqdm
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from plot_specialization import plot_cka_heatmap
+from agri_data import AgriDataset
 from litgpt.tokenizer import Tokenizer 
 from litgpt.model import GPT
 from litgpt.config import Config
 from litgpt.utils import chunked_cross_entropy
-from tqdm import tqdm
-from agri_data import AgriDataset
-from plot_specialization import plot_cka_heatmap
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 #config
 
-RUN_TAG = "run_test"  # <--- EDIT THIS PER RUN
+RUN_TAG = "16_02_run_test_39k"  # <--- EDIT THIS PER RUN
 
 DISTILL_CONFIG = {
     "alpha": 0.5,
@@ -32,6 +34,7 @@ DISTILL_CONFIG = {
 MAX_SEQ_LENGTH = 3072
 BATCH_SIZE = 2
 ACCUMULATE_GRAD_STEPS = 8  # 1 * 4 = Effective Batch Size 4 (Better stability)
+NUM_EPOCHS = 1
 
 # Generate a short 4-char unique ID (e.g., 'A9D2') to prevent overwrites
 short_id = uuid.uuid4().hex[:6].upper()
@@ -44,6 +47,10 @@ CHECKPOINT_ROOT = Path(f"checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/{run_name}")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
 (OUTPUT_ROOT / "audits").mkdir(exist_ok=True)
+
+DATA_PATH = "data/train_final_merged.parquet"
+TEACHER_CKPT = "checkpoints/Qwen/Qwen3-8B/lit_model.pth"
+STUDENT_INIT = "checkpoints/Qwen/Qwen3-0.6B-moe-init/lit_model.pth" 
 
 print(f"Starting Run: {run_name}")
 print(f"Output Dir:   {OUTPUT_ROOT}")
@@ -67,9 +74,7 @@ print(f"Parameters saved to: {config_path}")
 
 
 class LossLogger:
-    def __init__(self, log_dir="outputs/training_log.csv"):
-        self.file_path = Path(log_dir)
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, log_dir):
         self.file_path = log_dir / "training_log.csv"
         self.headers = ["step", "total_loss", "kl_loss", "ce_loss", "cka_loss", "div_loss", "max_load"]
         with open(self.file_path, 'w', newline='') as f:
@@ -109,74 +114,89 @@ class LinearCKALoss(nn.Module):
 @torch.no_grad()
 def audit_expert_specialization(student, cka_fn, batch, step):
     """
-    Runs every 500 steps. Forces ALL experts to process the SAME tokens
-    to calculate a perfect Output-Space CKA matrix.
-    It proves that  loss_diversity isn't just "adding noise" to the weights, 
-    but is forcing the experts to learn distinct functional mappings for your Hindi Agricultural data.
+    Live Training Audit: Uses a forward hook to capture real contextual 
+    hidden states from the current batch and calculates expert similarity.
     """
     student.eval()
     device = next(student.parameters()).device
-    # Use a small subset of the batch for the audit to save VRAM
     
-    audit_input = batch[0][:2].to(device).long() 
-
+    # 1. Prepare data from the current batch
+    input_ids = batch[0] # batch is (input_ids, loss_mask)
+    # Slice to a small context for speed/VRAM during audit
+    if input_ids.size(1) > 256:
+        input_ids = input_ids[:, :256]
+    
     save_dir = OUTPUT_ROOT / "audits"
     matrix_path = save_dir / f"cka_matrix_step_{step}.pth"
     
-    print(f"\nStep {step}: Expert Specialization Audit ")
-    
-    # Extract Expert Logic - target a specific layer - for the thesis chart
+    # 2. Setup the Hook to capture Layer 14 (Middle) input
     target_layer_idx = student.config.n_layer // 2
-    layer = student.transformer.h[target_layer_idx].mlp
+    target_block = student.transformer.h[target_layer_idx]
+    
+    captured_input = {}
+    def hook_fn(module, args, output):
+        # args[0] is the hidden state entering the MLP/Expert block
+        captured_input['hidden_state'] = args[0].detach()
+
+    handle = target_block.mlp.register_forward_hook(hook_fn)
+    
+    # 3. Run a mini-forward pass to trigger the hook
+    try:
+        student(input_ids)
+    finally:
+        handle.remove() # Always remove hooks to prevent memory leaks
+    
+    real_hidden_state = captured_input['hidden_state']
+    layer = target_block.mlp
     
     if hasattr(layer, 'experts'):
-        # Get hidden states entering the MLP
-        # This requires a quick forward pass up to that layer
-        # For simplicity, we compare expert outputs on a dummy latent vector
-        latent_dim = student.config.n_embd
-        dummy_latent = torch.randn(1, 128, latent_dim, device=device, dtype=torch.bfloat16)
+        print(f"\nStep {step}: Expert Specialization Audit (Real-Data Hook)")
         
-        expert_outputs = [expert(dummy_latent) for expert in layer.experts]
+        # 4. Pass captured real states through each expert
+        expert_outputs = [expert(real_hidden_state) for expert in layer.experts]
         
-        # Calculate CKA Matrix (N_expert x N_expert)
         n_exp = len(expert_outputs)
         cka_matrix = torch.zeros((n_exp, n_exp))
+        latent_dim = real_hidden_state.size(-1)
         
         for i in range(n_exp):
             for j in range(n_exp):
-                # We want 1 - CKA (Distance)
-                cka_matrix[i, j] = 1 - cka_fn(expert_outputs[i].view(-1, latent_dim), 
-                                              expert_outputs[j].view(-1, latent_dim))
+                # We calculate similarity (1.0 = identical)
+                # Note: If your cka_fn in train_distill returns (1 - score), 
+                # make sure to adjust this to store (1 - result) for a similarity heatmap.
+                sim = 1 - cka_fn(expert_outputs[i].view(-1, latent_dim), 
+                                 expert_outputs[j].view(-1, latent_dim))
+                cka_matrix[i, j] = sim
         
+        # 5. Save and Plot
         torch.save(cka_matrix, matrix_path)
+        
+        # Call your existing plotting function (Ensure it handles Similarity)
         plot_cka_heatmap(matrix_path, save_path=save_dir / f"heatmap_step_{step}.png")
-        print(f"Audit matrix and heatmap saved to {save_dir}")
-    
-        print(f"Layer {target_layer_idx} Avg Expert Distance: {cka_matrix.mean().item():.4f}")
+        
+        avg_sim = cka_matrix.mean().item()
+        print(f"Layer {target_layer_idx} Avg Expert Similarity: {avg_sim:.4f}")
     
     student.train()
 
 
-def train_distill(
-    student_path="checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/run_test_E86460/step-500.pth",
-    teacher_path="checkpoints/Qwen/Qwen3-8B/lit_model.pth",
-    data_loader=None
-):
+def train_distill():
+    start_time = datetime.now()
     device = torch.device("cuda") 
     logger = LossLogger(OUTPUT_ROOT)
 
     tokenizer = Tokenizer("checkpoints/Qwen/Qwen3-0.6B")
     dataset = AgriDataset(
-            data_path="data/agri_hi_train.parquet", 
+            data_path=DATA_PATH, 
             tokenizer=tokenizer, 
             max_seq_length=MAX_SEQ_LENGTH 
         )
 
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
     print("Loading 8B Teacher in BF16...")
     teacher = GPT(Config.from_name("Qwen3-8B")).to(device, dtype=torch.bfloat16) 
-    teacher.load_state_dict(torch.load(teacher_path, mmap=True, weights_only=True), strict=False)
+    teacher.load_state_dict(torch.load(TEACHER_CKPT, mmap=True, weights_only=True), strict=False)
     teacher.eval()
     
     for param in teacher.parameters():
@@ -184,11 +204,27 @@ def train_distill(
 
     print("Loading 0.6B-MoE Student in BF16...")
     student = GPT(Config.from_name("Qwen3-0.6B-MoE")).to(device, dtype=torch.bfloat16)
-    student.load_state_dict(torch.load(student_path))
+    student.load_state_dict(torch.load(STUDENT_INIT, map_location=device, weights_only=True))
+
+    #adding guassian noise
+    print("Applying (Gaussian noise) Symmetry Breaking to Experts...")
+    with torch.no_grad():
+        for name, param in student.named_parameters():
+            if "mlp.experts" in name and "weight" in name:
+                param.add_(torch.randn_like(param) * 1e-4)
+
     # Enable Gradient Checkpointing on Student to save VRAM, critical for the H100 80GB when running two models
     student.gradient_checkpointing_enable()
 
-    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=2e-5) # 8-bit AdamW saves ~2GB
+    # Slightly higher LR because we are using a Scheduler now
+    # optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=5e-5) # 8-bit AdamW saves ~2GB
+    optimizer = torch.optim.AdamW(student.parameters(), lr=5e-5, eps=1e-8)
+
+
+    # Calculate total steps for scheduler
+    total_steps = len(data_loader) * NUM_EPOCHS
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+
     cka_fn = LinearCKALoss()
 
     # Layer Mapping (teacher to student)
@@ -203,125 +239,156 @@ def train_distill(
 
 
     n_experts = student.config.n_expert    
+    print(f"Training Started. Steps per Epoch: {len(data_loader)}")
     optimizer.zero_grad() 
+    
+    global_step = 0
+    for epoch in range(NUM_EPOCHS):
+        print(f"\n=== EPOCH {epoch+1}/{NUM_EPOCHS} ")
 
-    for batch_idx, (input_ids, loss_mask) in enumerate(tqdm(data_loader)):
-        input_ids = input_ids.to(device).long()
-        loss_mask = loss_mask.to(device)
+        for batch_idx, (input_ids, loss_mask) in enumerate(tqdm(data_loader, desc="Training")):
+            input_ids = input_ids.to(device).long()
+            loss_mask = loss_mask.to(device)
 
-        # 1. Teacher Forward (No Grads)
-        with torch.no_grad():
-            t_logits, t_features = teacher(input_ids, return_features=True)
+            # Teacher Forward (No Grads)
+            with torch.no_grad():
+                t_logits, t_features = teacher(input_ids, return_features=True)
 
-        # 2. Student Forward
-        s_logits, s_features = student(input_ids, return_features=True)
+            # Student Forward
+            s_logits, s_features = student(input_ids, return_features=True)
 
-        # LOSS A: Soft Logit Distillation (With Masking)
-        # We calculate KL Divergence only on the unmasked tokens (Thoughts + Advisory)
+            # LOSS A: Soft Logit Distillation (With Masking)
+            # We calculate KL Divergence only on the unmasked tokens (Thoughts + Advisory)
+            T = DISTILL_CONFIG["T"] # Distillation Temperature
 
-        T = DISTILL_CONFIG["T"] # Distillation Temperature
-        # Shapes: [B, T, Vocab]
-        student_log_probs = F.log_softmax(s_logits / DISTILL_CONFIG["T"], dim=-1)
-        teacher_probs = F.softmax(t_logits / DISTILL_CONFIG["T"], dim=-1)
-        # Standard KLDiv reduces to a scalar, so we need to implement manual reduction for masking
-        kl_loss_pointwise = F.kl_div(student_log_probs, teacher_probs, reduction="none", log_target=False)
-        # kl_loss_pointwise shape: [B, T, Vocab] -> Sum over vocab -> [B, T]
-        kl_loss_per_token = kl_loss_pointwise.sum(dim=-1) 
-        # Apply Mask
-        # loss_mask is [B, T], 1 for learnable tokens, 0 for prompt
-        active_loss = (kl_loss_per_token * loss_mask).sum() / (loss_mask.sum() + 1e-6)
-        loss_kl = active_loss * (DISTILL_CONFIG["T"]**2)
-
-
-        #LOSS B: Cross-Entropy 
-        # Shift targets: logits[0] predicts input_ids[1]
-        shift_logits = s_logits[..., :-1, :].contiguous()
-        shift_labels = input_ids[..., 1:].contiguous()
-        shift_mask = loss_mask[..., 1:].contiguous()
-
-        # Calculate standard CE
-        ce_loss_pointwise = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
-        ce_loss_pointwise = ce_loss_pointwise.view(shift_labels.size())
-        # Apply mask
-        loss_ce = (ce_loss_pointwise * shift_mask).sum() / (shift_mask.sum() + 1e-6)
+            # Shapes: [B, T, Vocab]
+            student_log_probs = F.log_softmax(s_logits / T, dim=-1)
+            teacher_probs = F.softmax(t_logits / T, dim=-1)
+            # Standard KLDiv reduces to a scalar, so we need to implement manual reduction for masking
+            # kl_loss_pointwise shape: [B, T, Vocab] -> Sum over vocab -> [B, T]
+            kl_loss_pointwise = F.kl_div(student_log_probs, teacher_probs, reduction="none", log_target=False).sum(dim=-1) 
+            # Apply Mask
+            # loss_mask is [B, T], 1 for learnable tokens, 0 for prompt
+            active_loss = (kl_loss_pointwise * loss_mask).sum() / (loss_mask.sum() + 1e-6)
+            loss_kl = active_loss * (T**2)
 
 
-        # LOSS C: Feature CKA Distillation 
-        loss_cka = sum(cka_fn(s_features[s], t_features[t]) for s, t in mapping.items()) / len(mapping)
+            #LOSS B: Cross-Entropy 
+            # Shift targets: logits[0] predicts input_ids[1]
+            shift_logits = s_logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            shift_mask = loss_mask[..., 1:].contiguous()
 
-        # LOSS D: Expert Diversity (The Research Key) 
-        loss_diversity = 0
-        moe_layers = [h.mlp for h in student.transformer.h if hasattr(h.mlp, 'experts')]
-        
-        for mlp in moe_layers:
-            layer_div = 0
-            pairs = 0
-            # Compare ALL experts in the layer to force global divergence
-            # This is more robust than just comparing the top-k chosen ones
-            for i in range(n_experts):
-                for j in range(i + 1, n_experts):
-                    # Use Weights (fc_1) to ensure matching dimensions for CKA
-                    w_i = mlp.experts[i].fc_1.weight
-                    w_j = mlp.experts[j].fc_1.weight
-                    layer_div += (1 - cka_fn(w_i, w_j))
-                    pairs += 1
-            loss_diversity += (layer_div / pairs)
-            
-        loss_diversity /= len(moe_layers)
-
-        # Total Loss 
-        total_loss = (DISTILL_CONFIG["alpha"] * loss_kl) + \
-                     (DISTILL_CONFIG["lambda"] * loss_ce) + \
-                     (DISTILL_CONFIG["beta"] * loss_cka) + \
-                     (DISTILL_CONFIG["gamma"] * loss_diversity)        
+            # Calculate standard CE
+            ce_loss_pointwise = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none").view(shift_labels.size())
+            # Apply mask
+            loss_ce = (ce_loss_pointwise * shift_mask).sum() / (shift_mask.sum() + 1e-6)
 
 
-        loss_scaled = total_loss / ACCUMULATE_GRAD_STEPS
-        loss_scaled.backward()
+            # LOSS C: Feature CKA Distillation 
+            loss_cka = sum(cka_fn(s_features[s], t_features[t]) for s, t in mapping.items()) / len(mapping)
 
-        # Step Optimizer ONLY every 'N' steps
-        if (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0:
-            # Gradient Clipping for MoE Stability
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+            # LOSS D: Expert Diversity (The Research Key) 
+            loss_diversity = 0
+            moe_layers = [h.mlp for h in student.transformer.h if hasattr(h.mlp, 'experts')]
+            moe_blocks = [(idx, h) for idx, h in enumerate(student.transformer.h) if hasattr(h.mlp, 'experts')]
 
-        #logging
-        all_indices = torch.cat([layer.mlp.last_indices for layer in student.transformer.h if hasattr(layer.mlp, 'last_indices')], dim=0)
-        max_load = (torch.bincount(all_indices.view(-1), minlength=n_experts).float() / all_indices.numel()).max().item()
+            for i, (layer_idx, block) in enumerate(moe_blocks):
+                if layer_idx == 0: continue 
+                # We need the input to the MLP for this layer. 
+                # Since s_features contains block outputs, let's use the 
+                # features from the PREVIOUS layer as the input to this MLP.
+                
+                # s_features[i-1] is the input to layer i
+                # We only need a small slice of tokens to save VRAM during diversity check
+                latent_input = s_features[layer_idx - 1].detach()[:, :128, :]
 
-        logger.log(batch_idx, total_loss.item(), loss_kl.item(), loss_ce.item(), loss_cka.item(), loss_diversity.item(), max_load)
+                expert_outputs = [block.mlp.experts[exp_idx](latent_input) for exp_idx in range(n_experts)]
 
-        #  THE AUDIT (Every 500 Steps) 
-        if batch_idx % 500 == 0 and batch_idx > 0:
-            audit_expert_specialization(student, cka_fn, [input_ids], batch_idx)
-            torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{batch_idx}.pth")
+                layer_div = 0
+                for i_exp in range(n_experts):
+                    for j_exp in range(i_exp + 1, n_experts):
+                        # Functional Diversity: Experts must produce different outputs
+                        layer_div += (1 - cka_fn(expert_outputs[i_exp], expert_outputs[j_exp]))
+                
+                loss_diversity += (layer_div / (n_experts * (n_experts - 1) / 2))
+                
+                del expert_outputs #to del the tensors accumulated after slicing
+
+            loss_diversity /= len(moe_layers)
 
 
-        if batch_idx % 10 == 0:
-            print(f"Step {batch_idx} | Total_Loss: {total_loss:.4f} | Max_Load: {max_load:.2%}")
+            # Total Loss 
+            total_loss = (DISTILL_CONFIG["alpha"] * loss_kl) + \
+                        (DISTILL_CONFIG["lambda"] * loss_ce) + \
+                        (DISTILL_CONFIG["beta"] * loss_cka) + \
+                        (DISTILL_CONFIG["gamma"] * loss_diversity)        
 
-        # Intermediate Saving
-        if batch_idx % 500 == 0 and batch_idx > 0:
-            torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{batch_idx}.pth")
+
+            loss_scaled = total_loss / ACCUMULATE_GRAD_STEPS
+            loss_scaled.backward()
+
+            # Step Optimizer ONLY every 'N' steps
+            if (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0:
+                # Gradient Clipping for MoE Stability
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step() # Update LR
+                optimizer.zero_grad()
+
+                global_step += 1
+
+                #logging
+                all_indices = torch.cat([layer.mlp.last_indices for layer in student.transformer.h if hasattr(layer.mlp, 'last_indices')], dim=0)
+                max_load = (torch.bincount(all_indices.view(-1), minlength=n_experts).float() / all_indices.numel()).max().item()
+
+                logger.log(global_step, total_loss.item(), loss_kl.item(), loss_ce.item(), loss_cka.item(), loss_diversity.item(), max_load)
+
+                # Print status
+                if global_step % 20 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    # print(f"Step {global_step} | Loss: {total_loss:.4f} | LR: {current_lr:.2e} | Load: {max_load:.2%}")
+
+                #  THE AUDIT (Every 500 Steps) 
+                if global_step % 200 == 0:
+                    audit_expert_specialization(student, cka_fn, [input_ids], global_step)
+                    torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{global_step}.pth")
+
+
+                if global_step % 10 == 0:
+                    print(f"Step {global_step} | Total_Loss: {total_loss:.4f} | Max_Load: {max_load:.2%}")
 
     # Save the final student state separately
     final_path = CHECKPOINT_ROOT / "lit_model.pth"
     torch.save(student.state_dict(), final_path)
-    audit_expert_specialization(student, cka_fn, [input_ids], batch_idx)
+    audit_expert_specialization(student, cka_fn, [input_ids], global_step)
 
 
     # Copy configuration files to make the model portable
     from litgpt.utils import copy_config_files
     copy_config_files(Path("checkpoints/Qwen/Qwen3-0.6B"), CHECKPOINT_ROOT)
-    print(f"✨ Distilled model saved to: {CHECKPOINT_ROOT}")
+    print(f"Distilled model saved to: {CHECKPOINT_ROOT}")
 
+    # --- 2. CAPTURE END TIME & LOG SUMMARY ---
+    end_time = datetime.now()
+    duration = end_time - start_time
+    
+    summary = {
+        "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_seconds": duration.total_seconds(),
+        "duration_formatted": str(duration)
+    }
+    
+    with open(OUTPUT_ROOT / "run_summary.json", "w") as f:
+        json.dump(summary, f, indent=4)
+        
+    print(f"✅ Finished! Total Duration: {duration}")
 
 
 
 if __name__ == "__main__":
     train_distill()
-
 
 
 

@@ -9,8 +9,9 @@ from pathlib import Path
 import os
 
 # --- CONFIGURATION ---
-log_file = "outputs/1_run_test_51751D/training_log.csv"
-output_dir = "outputs/plots/" # Folder to save individual plots
+log_file = "outputs/12_02_run_test_9A3A69/training_log.csv"
+output_dir = Path(log_file).parent
+# output_dir = "outputs/plots/" # Folder to save individual plots
 
 def smooth(scalars, weight=0.85):
     """Exponential Moving Average for cleaner lines."""
@@ -49,10 +50,10 @@ def plot_training_metrics():
     
     if 'total_loss' in df.columns:
         sns.lineplot(data=df, x="step", y="total_loss_smooth", 
-                     label="Total Loss", color="#1f77b4", linewidth=3)
+                     label="Total Loss", color="#1f77b4", linewidth=1)
     if 'kl_loss' in df.columns:
         sns.lineplot(data=df, x="step", y="kl_loss_smooth", 
-                     label="Distillation (KL) Loss", color="#ff7f0e", linestyle="--", linewidth=2.5)
+                     label="Distillation (KL) Loss", color="#ff7f0e", linestyle="-", linewidth=1)
     
     plt.title("Optimization Convergence", fontweight='bold', pad=15)
     plt.ylabel("Loss Value")
@@ -70,7 +71,7 @@ def plot_training_metrics():
     
     if 'cka_loss' in df.columns:
         sns.lineplot(data=df, x="step", y="cka_loss_smooth", 
-                     color="#2ca02c", linewidth=3, label="Feature Alignment (CKA)")
+                     color="#2ca02c", linewidth=1, label="Feature Alignment (CKA)")
         
         plt.title("Internal Representation Alignment", fontweight='bold', pad=15)
         plt.ylabel("Feature Distance")
@@ -90,10 +91,10 @@ def plot_training_metrics():
     
     if 'max_load' in df.columns:
         sns.lineplot(data=df, x="step", y="max_load_smooth", ax=ax1,
-                     color="#d62728", linewidth=3, label="Max Expert Load")
+                     color="#d62728", linewidth=1, label="Max Expert Load")
         
         # Ideal Baseline
-        ax1.axhline(y=0.125, color='black', linestyle=':', linewidth=2, label="Ideal Balance (12.5%)")
+        ax1.axhline(y=0.125, color='black', linestyle=':', linewidth=1, label="Ideal Balance (12.5%)")
         
         ax1.set_ylabel("Load Factor (0.0 - 1.0)", color="#d62728", fontweight='bold')
         ax1.tick_params(axis='y', labelcolor="#d62728")
@@ -104,7 +105,7 @@ def plot_training_metrics():
         if 'div_loss' in df.columns:
             ax2 = ax1.twinx()
             sns.lineplot(data=df, x="step", y="div_loss_smooth", ax=ax2,
-                         color="gray", alpha=0.5, linestyle="-.", linewidth=2, label="Diversity Loss")
+                         color="gray", alpha=0.5, linestyle="-.", linewidth=1, label="Diversity Loss")
             ax2.set_ylabel("Auxiliary Loss", color="gray")
             ax2.tick_params(axis='y', labelcolor="gray")
             

@@ -7,7 +7,7 @@ from litgpt.tokenizer import Tokenizer
 
 #  CONFIGURATION 
 # checkpoint_path = "checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/lit_model.pth"
-checkpoint_path = "checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/run_test_E86460/step-500.pth"
+checkpoint_path=  "checkpoints/Qwen/Qwen3-0.6B-Agri-Distilled/16_02_run_test_39k_814D09/step-1800.pth"
 tokenizer_dir = "checkpoints/Qwen/Qwen3-0.6B-moe-init" 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -185,10 +185,10 @@ def run_inference():
             model, 
             input_ids.unsqueeze(0), 
             max_new_tokens=3072, 
-            temperature=0.6, 
-            top_k=40,
+            temperature=0.4, 
+            top_k=50,
             eos_id=tokenizer.eos_id,
-            repetition_penalty=1.2
+            repetition_penalty=1.1,
         )
 
     # 5. Decode
