@@ -18,7 +18,7 @@ def plot_cka_heatmap(matrix_path, save_path="expert_specialization.png"):
         yticklabels=[f"Exp {i}" for i in range(len(cka_matrix))]
     )
     
-    plt.title("Expert Output Diversity (1 - CKA Score)\nHigher = More Specialized Experts")
+    plt.title("Expert Output Diversity\n")
     plt.xlabel("Expert Index")
     plt.ylabel("Expert Index")
     plt.savefig(save_path)

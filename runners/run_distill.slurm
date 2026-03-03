@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=agri_distill
-#SBATCH --partition=debug
+#SBATCH --job-name=finetune
+#SBATCH --partition=rl
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=42:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1

@@ -223,7 +223,7 @@ nvidia-smi
 watch -n 1 nvidia-smi
 
 * Start Training: Run 
-    ./launch_train.sh 
+    ./runners/launch_train.sh 
     within a tmux session 
 
         Screen & Tmux: Why and How
@@ -246,7 +246,10 @@ watch -n 1 nvidia-smi
             When you log back in later, type tmux attach to return to your running session.
 
 * to submit slurm
-sbatch run_distill.slurm
+sbatch runners/run_distill.slurm
+
+*cancel job
+scancel <JOB_ID>
 
 * to check progress
 squeue -u anurag
@@ -265,7 +268,7 @@ cat logs/train_22408.err
 
 
 * Resume if Time Runs Out
-    If the 4-hour limit hits and the job dies, you don't need to panic.
+    If the 4-hour limit hits and the job dies.
 
     Check the logs: tail -n 20 logs/train_22365.out to see the last step saved.
 
@@ -277,7 +280,7 @@ cat logs/train_22408.err
 
 
 * 
-python test_inference.py
+python -m inference.test_inference
 
 * 
 python plot_results.py
@@ -323,6 +326,17 @@ du -sh *
 
 ### References
 * your current $1e-5$ approach is the standard baseline used in the original Sparse Upcycling paper (Komatsuzaki et al.).
+
+* for eval: 
+    Reference Paper: Feng et al. (2020), "Language-agnostic BERT Sentence Embedding" (Published by Google Research).
+        LaBSE: Tests semantic meaning (Did it say the same thing, even if it used different words?).
+    
+    Reference Paper: Popović (2015), "chrF: character n-gram F-score for automatic MT evaluation" (Standard in WMT - Workshop on Machine Translation).
+        chrF++: Tests exact grammar and character-level spelling.
+    
+    Reference Paper: Zheng et al. (2023), "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena" (Published by LMSYS / UC Berkeley).
+        LLM-as-a-Judge: Tests human vibes (Tone, Safety, Logic).
+
 
 
 ### Tip for your Defense

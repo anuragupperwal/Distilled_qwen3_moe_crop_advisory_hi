@@ -13,7 +13,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from plot_specialization import plot_cka_heatmap
+from evaluation.plot_specialization import plot_cka_heatmap
 from agri_data import AgriDataset
 from litgpt.tokenizer import Tokenizer 
 from litgpt.model import GPT
@@ -22,7 +22,7 @@ from litgpt.utils import chunked_cross_entropy
 
 #config
 
-RUN_TAG = "16_02_run_test_39k"  # <--- EDIT THIS PER RUN
+RUN_TAG = "02_03_run_test_80k"  # <--- EDIT THIS PER RUN
 
 DISTILL_CONFIG = {
     "alpha": 0.5,
@@ -31,12 +31,12 @@ DISTILL_CONFIG = {
     "gamma": 1.5, 
     "T": 2.0 
 }
-MAX_SEQ_LENGTH = 3072
-BATCH_SIZE = 2
+MAX_SEQ_LENGTH = 4096
+BATCH_SIZE = 2 
 ACCUMULATE_GRAD_STEPS = 8  # 1 * 4 = Effective Batch Size 4 (Better stability)
 NUM_EPOCHS = 1
 
-# Generate a short 4-char unique ID (e.g., 'A9D2') to prevent overwrites
+# Generate a short 6-char unique ID (e.g., 'A9D2') to prevent overwrites
 short_id = uuid.uuid4().hex[:6].upper()
 run_name = f"{RUN_TAG}_{short_id}"
 
@@ -48,7 +48,7 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
 (OUTPUT_ROOT / "audits").mkdir(exist_ok=True)
 
-DATA_PATH = "data/train_final_merged.parquet"
+DATA_PATH = "data/train_bilingual_mixed_83k_agri65k.parquet"
 TEACHER_CKPT = "checkpoints/Qwen/Qwen3-8B/lit_model.pth"
 STUDENT_INIT = "checkpoints/Qwen/Qwen3-0.6B-moe-init/lit_model.pth" 
 
@@ -65,7 +65,7 @@ experiment_settings = {
     "max_seq_length": MAX_SEQ_LENGTH,
     "batch_size": BATCH_SIZE,
     "accum_steps": ACCUMULATE_GRAD_STEPS,
-    "dataset": "agri_hi_train.parquet"
+    "dataset": DATA_PATH
 }
 with open(config_path, 'w') as f:
     json.dump(experiment_settings, f, indent=4)
@@ -329,7 +329,11 @@ def train_distill():
             loss_scaled.backward()
 
             # Step Optimizer ONLY every 'N' steps
-            if (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0:
+
+            is_accumulation_step = (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0
+            is_last_batch = (batch_idx + 1) == len(data_loader)
+            # if (batch_idx + 1) % ACCUMULATE_GRAD_STEPS == 0:
+            if is_accumulation_step or is_last_batch:
                 # Gradient Clipping for MoE Stability
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 optimizer.step()
@@ -347,16 +351,13 @@ def train_distill():
                 # Print status
                 if global_step % 20 == 0:
                     current_lr = scheduler.get_last_lr()[0]
-                    # print(f"Step {global_step} | Loss: {total_loss:.4f} | LR: {current_lr:.2e} | Load: {max_load:.2%}")
+                    print(f"Step {global_step} | Total_Loss: {total_loss:.4f} | Load: {max_load:.2%} | LR: {current_lr:.2e} ")
 
                 #  THE AUDIT (Every 500 Steps) 
                 if global_step % 200 == 0:
                     audit_expert_specialization(student, cka_fn, [input_ids], global_step)
                     torch.save(student.state_dict(), CHECKPOINT_ROOT / f"step-{global_step}.pth")
 
-
-                if global_step % 10 == 0:
-                    print(f"Step {global_step} | Total_Loss: {total_loss:.4f} | Max_Load: {max_load:.2%}")
 
     # Save the final student state separately
     final_path = CHECKPOINT_ROOT / "lit_model.pth"

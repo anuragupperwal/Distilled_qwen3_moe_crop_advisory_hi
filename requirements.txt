@@ -12,7 +12,7 @@ transformers
 scipy
 numpy
 pandas
-
+datasets
 torchmetrics
 matplotlib
 hf_transfer
@@ -27,3 +27,8 @@ rouge_score
 nltk 
 sacrebleu
 scikit-learn
+
+sacrebleu
+sentence-transformers
+google-generativeai
+dotenv

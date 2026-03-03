@@ -9,7 +9,7 @@ from pathlib import Path
 import os
 
 # --- CONFIGURATION ---
-log_file = "outputs/12_02_run_test_9A3A69/training_log.csv"
+log_file = "outputs/16_02_run_test_39k_full_run/training_log.csv"
 output_dir = Path(log_file).parent
 # output_dir = "outputs/plots/" # Folder to save individual plots
 
@@ -54,6 +54,9 @@ def plot_training_metrics():
     if 'kl_loss' in df.columns:
         sns.lineplot(data=df, x="step", y="kl_loss_smooth", 
                      label="Distillation (KL) Loss", color="#ff7f0e", linestyle="-", linewidth=1)
+    if 'ce_loss' in df.columns:
+        sns.lineplot(data=df, x="step", y="ce_loss_smooth", 
+                     label="CE Loss", color="#127f0e", linestyle="-", linewidth=1)
     
     plt.title("Optimization Convergence", fontweight='bold', pad=15)
     plt.ylabel("Loss Value")
